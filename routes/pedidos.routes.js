@@ -442,7 +442,7 @@ router.get('/cola/:maquina', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const query = `
-      SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia,
+      SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia, o.cantidad_faltante,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
         COALESCE(NULLIF(TRIM(o.maquina_asignada), ''), TRIM(UPPER(p.ruta_sugerida)), 'COR-JS') AS maquina_asignada
