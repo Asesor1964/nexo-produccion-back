@@ -477,13 +477,32 @@ router.put('/:id/produccion', async (req, res) => {
   try {
     const numOrden = parseInt(id, 10);
     const cantFab = parseFloat(cantidad_fabricada) || 0;
-    const estadoFinal = estado || 'Finalizada';
 
+    // 1. Consultar la orden original para comparar con la meta programada
+    const ordenOrigRes = await db.query('SELECT * FROM ordenes_produccion WHERE numero_orden = $1', [numOrden]);
+    if (ordenOrigRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Orden no encontrada' });
+    }
+    const ordenOriginal = ordenOrigRes.rows[0];
+    const metaProgramada = parseFloat(ordenOriginal.cantidad_programada) || 0;
+
+    // 2. Evaluar si hubo faltante
+    const hayFaltante = cantFab < metaProgramada;
+    const unidadesFaltantes = hayFaltante ? (metaProgramada - cantFab) : 0;
+    const estadoFinal = hayFaltante ? 'Finalizada Parcial' : 'Finalizada';
+
+    // 3. Actualizar la orden en la BD guardando la cantidad fabricada y el faltante
     await db.query(
-      `UPDATE ordenes_produccion SET estado = $1, cantidad_fabricada = $2::numeric, operador = $3 WHERE numero_orden = $4::int`,
-      [estadoFinal, cantFab, operador || 'General', numOrden]
+      `UPDATE ordenes_produccion 
+       SET estado = $1, 
+           cantidad_fabricada = $2::numeric, 
+           operador = $3,
+           cantidad_faltante = $4::numeric 
+       WHERE numero_orden = $5::int`,
+      [estadoFinal, cantFab, operador || 'General', unidadesFaltantes, numOrden]
     );
 
+    // 4. Registrar tiempos muertos si los hubo
     if (Array.isArray(paradas) && paradas.length > 0) {
       for (const p of paradas) {
         await db.query(
@@ -500,7 +519,12 @@ router.put('/:id/produccion', async (req, res) => {
       };
     }
 
-    res.json({ status: 'ok', mensaje: 'Orden finalizada correctamente' });
+    res.json({ 
+      status: 'ok', 
+      mensaje: hayFaltante 
+        ? `Orden cerrada parcialmente. Faltante registrado: ${unidadesFaltantes} cajas pendientes.` 
+        : 'Orden finalizada correctamente' 
+    });
   } catch (error) {
     res.status(500).json({ error: 'Error al finalizar la orden en BD: ' + error.message });
   }
