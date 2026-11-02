@@ -7,14 +7,31 @@ if (!global.estadoVivoMaquinas) {
   global.estadoVivoMaquinas = {};
 }
 
-// Función auxiliar para cruzar máquinas (Ej: "IMP-JS" -> "JS")
+// Función auxiliar blindada según las rutas reales de Maestro_Productos.csv
 const extraerNucleoMaquina = (cod) => {
   if (!cod) return '';
-  return cod.toUpperCase()
-    .replace('IMP-', '')
-    .replace('COR-', '')
-    .replace('TRO-', '')
-    .replace('PEG-', '')
+  const texto = cod.toUpperCase().trim();
+
+  // 1. Mapeo directo de alias críticos de planta -> código real en CSV
+  if (texto.includes('WAR')) return 'WAR'; // Convierte "WARD", "WARD-TROQ", "COR-WARx2" -> "WAR"
+  if (texto.includes('JS'))  return 'JS';  // Convierte "COR-JS", "IMP-JS", "COR-JSx2" -> "JS"
+  if (texto.includes('SS'))  return 'SS';  // Convierte "COR-SS", "IMP-SS", "COR-SSx2" -> "SS"
+  if (texto.includes('PBO')) return 'PBO'; // Bobst / Pegadora PBO
+  if (texto.includes('PLM')) return 'PLM'; // Pegadora PLM
+  if (texto.includes('PEG')) return 'PEG'; // Pegado general
+  if (texto.includes('DIV')) return 'DIV'; // Divisora (DIV, COR-DIVx2)
+  if (texto.includes('TPL')) return 'TPL'; // Troqueladora Plana (TPLx2, TPLx4)
+  if (texto.includes('TER')) return 'TER'; // Termo / COR-TER
+  if (texto.includes('PLO')) return 'PLO'; // Plotter (COR-PLO)
+  if (texto.includes('TRA')) return 'TRA'; // Guillotina / Tramo (TRA)
+  if (texto.includes('DYF')) return 'DYF'; // DYF
+  if (texto.includes('CHI')) return 'CHI'; // CHI
+
+  // 2. Limpieza general para futuras máquinas
+  return texto
+    .replace(/^(IMP-|COR-|TROQ-|TRO-|PEG-)/, '')
+    .replace(/(-TROQ|-IMP|-COR|-PEG)$/, '')
+    .replace(/X[0-9]+$/i, '')
     .trim();
 };
 
@@ -186,13 +203,10 @@ router.get(['/recursos/operadores/todos', '/recursos/operadores', '/operadores']
   }
 });
 
-// Este endpoint debe estar en tu archivo de rutas de Pedidos / Recursos (ej: pedidos.routes.js)
 router.post('/recursos/operadores', async (req, res) => {
   const { nombre, rol } = req.body;
   try {
     const rolFinal = rol || 'Maquinista';
-    
-    // Nos aseguramos de que la columna exista en la base de datos
     await db.query(`ALTER TABLE operadores ADD COLUMN IF NOT EXISTS rol VARCHAR(30) DEFAULT 'Maquinista'`);
     
     const result = await db.query(
@@ -244,7 +258,6 @@ router.get(['/recursos/maquinas/todas', '/recursos/maquinas', '/maquinas'], asyn
     `);
     if (result.rows.length > 0) return res.json(result.rows);
     
-        
     const fallback = await db.query(`
       SELECT DISTINCT TRIM(UPPER(maquina_asignada)) AS codigo_maquina 
       FROM ordenes_produccion 
@@ -401,6 +414,7 @@ router.get('/cola/:maquina', async (req, res) => {
       WHERE 
         (
           TRIM(UPPER(o.maquina_asignada)) LIKE '%' || TRIM(UPPER($1)) || '%' 
+          OR TRIM(UPPER($1)) LIKE '%' || TRIM(UPPER(NULLIF(o.maquina_asignada, ''))) || '%'
           OR ($2 <> '' AND TRIM(UPPER(o.maquina_asignada)) LIKE '%' || $2 || '%')
         )
         AND TRIM(LOWER(COALESCE(o.estado, ''))) IN ('habilitada', 'en produccion', 'en producción')
