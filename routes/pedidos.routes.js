@@ -439,10 +439,35 @@ router.get('/cola/:maquina', async (req, res) => {
 // 6. LISTADO GENERAL Y SINCRONIZACIÓN
 // =========================================================================
 
+// Funciones auxiliares para limpiar datos crudos de Procusto
+const formatearFechaParaPG = (fechaStr) => {
+  if (!fechaStr) return null;
+  const limpia = String(fechaStr).trim();
+  if (!limpia) return null;
+  const partes = limpia.split(/[\/\-]/);
+  if (partes.length === 3) {
+    if (partes[0].length === 4) return limpia; // Ya es YYYY-MM-DD
+    const dia = partes[0].padStart(2, '0');
+    const mes = partes[1].padStart(2, '0');
+    const anio = partes[2].length === 2 ? `20${partes[2]}` : partes[2];
+    const fechaISO = `${anio}-${mes}-${dia}`;
+    return isNaN(Date.parse(fechaISO)) ? null : fechaISO;
+  }
+  return null;
+};
+
+const parsearNumeroCSV = (val) => {
+  if (val === null || val === undefined || val === '') return null;
+  if (typeof val === 'number') return isNaN(val) ? null : val;
+  const limpio = String(val).replace(/\./g, '').replace(',', '.').trim();
+  const num = parseFloat(limpio);
+  return isNaN(num) ? null : num;
+};
+
 router.get('/', async (req, res) => {
   try {
     const query = `
-      SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia, o.cantidad_faltante,
+      SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia, COALESCE(o.cantidad_faltante, 0) AS cantidad_faltante,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
         COALESCE(NULLIF(TRIM(o.maquina_asignada), ''), TRIM(UPPER(p.ruta_sugerida)), 'COR-JS') AS maquina_asignada
@@ -453,7 +478,135 @@ router.get('/', async (req, res) => {
     const { rows } = await db.query(query);
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ error: 'Error al obtener pedidos' });
+    console.error('❌ Error en GET /api/pedidos:', error.message);
+    res.status(500).json({ error: 'Error al obtener pedidos: ' + error.message });
+  }
+});
+
+router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
+  const listaPedidos = req.body.pedidos || req.body.ordenes || (Array.isArray(req.body) ? req.body : []);
+
+  if (!Array.isArray(listaPedidos) || listaPedidos.length === 0) {
+    return res.status(400).json({ error: 'No se recibieron pedidos válidos para sincronizar.' });
+  }
+
+  try {
+    // 1. Blindaje preventivo de columnas en la tabla
+    await db.query(`
+      ALTER TABLE ordenes_produccion 
+        ADD COLUMN IF NOT EXISTS cliente VARCHAR(150),
+        ADD COLUMN IF NOT EXISTS descripcion_producto TEXT,
+        ADD COLUMN IF NOT EXISTS fecha_pedido DATE,
+        ADD COLUMN IF NOT EXISTS rubro VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS largo NUMERIC,
+        ADD COLUMN IF NOT EXISTS ancho NUMERIC,
+        ADD COLUMN IF NOT EXISTS plancha VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS m2_tot NUMERIC,
+        ADD COLUMN IF NOT EXISTS m2_pend NUMERIC,
+        ADD COLUMN IF NOT EXISTS peso NUMERIC,
+        ADD COLUMN IF NOT EXISTS prioridad_secuencia INTEGER DEFAULT 999,
+        ADD COLUMN IF NOT EXISTS cantidad_fabricada NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cantidad_faltante NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS operador VARCHAR(100);
+    `);
+
+    // 2. Cargamos el maestro de productos en memoria para cruce instantáneo
+    const maestroRes = await db.query(
+      'SELECT codigo_producto, cliente, descripcion, largo_mm, ancho_mm, ruta_sugerida FROM maestro_productos'
+    );
+    const maestroMap = new Map();
+    maestroRes.rows.forEach((m) => {
+      if (m.codigo_producto) {
+        maestroMap.set(String(m.codigo_producto).trim().toUpperCase(), m);
+      }
+    });
+
+    let procesados = 0;
+    let omitidos = 0;
+
+    // 3. Procesamos cada pedido individualmente con upsert seguro
+    for (const item of listaPedidos) {
+      const rawNum = item.numero_orden ?? item.numero ?? item.id;
+      const numOrden = parseInt(String(rawNum || '').replace(/\./g, '').trim(), 10);
+
+      // Filtro estricto: N° de orden válido de planta (1 a 999999)
+      if (!numOrden || isNaN(numOrden) || numOrden <= 0 || numOrden > 999999) {
+        omitidos++;
+        continue;
+      }
+
+      const cantProg = Math.round(parsearNumeroCSV(item.cantidad_programada ?? item.cantidad ?? 0) || 0);
+      
+      // Filtro anti-basura: si la cantidad programada es 0 o menor, se omite
+      if (cantProg <= 0) {
+        omitidos++;
+        continue;
+      }
+
+      const codProd = String(item.codigo_producto ?? item.codigo ?? 'SIN_CODIGO').trim();
+      const maestroMatch = maestroMap.get(codProd.toUpperCase()) || {};
+
+      const clienteFinal = String(item.cliente || '').trim() || maestroMatch.cliente || 'Sin cliente';
+      const descFinal = String(item.descripcion_producto || item.descripcion || '').trim() || maestroMatch.descripcion || 'Sin descripción';
+      const fechaPed = formatearFechaParaPG(item.fecha_pedido);
+      const fechaEnt = formatearFechaParaPG(item.fecha_entrega);
+      const rubro = item.rubro ? String(item.rubro).trim() : null;
+
+      const largoFinal = parsearNumeroCSV(item.largo) ?? maestroMatch.largo_mm ?? null;
+      const anchoFinal = parsearNumeroCSV(item.ancho) ?? maestroMatch.ancho_mm ?? null;
+      const plancha = item.plancha ? String(item.plancha).trim() : null;
+      const m2Tot = parsearNumeroCSV(item.m2_tot);
+      const m2Pend = parsearNumeroCSV(item.m2_pend);
+      const peso = parsearNumeroCSV(item.peso);
+
+      const rutaCandidata = String(item.maquina_asignada ?? item.ruta ?? '').trim().toUpperCase();
+      const rutaEsValida = rutaCandidata && isNaN(rutaCandidata) && !rutaCandidata.includes(',');
+      const rutaFinal = rutaEsValida
+        ? rutaCandidata
+        : (maestroMatch.ruta_sugerida ? String(maestroMatch.ruta_sugerida).trim().toUpperCase() : 'COR-JS');
+
+      await db.query(
+        `INSERT INTO ordenes_produccion (
+          numero_orden, codigo_producto, cliente, descripcion_producto,
+          cantidad_programada, fecha_pedido, fecha_entrega, rubro,
+          largo, ancho, plancha, m2_tot, m2_pend, peso,
+          maquina_asignada, estado
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'Pendiente')
+        ON CONFLICT (numero_orden) DO UPDATE SET
+          codigo_producto = EXCLUDED.codigo_producto,
+          cliente = COALESCE(NULLIF(EXCLUDED.cliente, 'Sin cliente'), ordenes_produccion.cliente),
+          descripcion_producto = COALESCE(NULLIF(EXCLUDED.descripcion_producto, 'Sin descripción'), ordenes_produccion.descripcion_producto),
+          cantidad_programada = EXCLUDED.cantidad_programada,
+          fecha_pedido = COALESCE(EXCLUDED.fecha_pedido, ordenes_produccion.fecha_pedido),
+          fecha_entrega = COALESCE(EXCLUDED.fecha_entrega, ordenes_produccion.fecha_entrega),
+          rubro = COALESCE(EXCLUDED.rubro, ordenes_produccion.rubro),
+          largo = COALESCE(EXCLUDED.largo, ordenes_produccion.largo),
+          ancho = COALESCE(EXCLUDED.ancho, ordenes_produccion.ancho),
+          plancha = COALESCE(EXCLUDED.plancha, ordenes_produccion.plancha),
+          m2_tot = COALESCE(EXCLUDED.m2_tot, ordenes_produccion.m2_tot),
+          m2_pend = COALESCE(EXCLUDED.m2_pend, ordenes_produccion.m2_pend),
+          peso = COALESCE(EXCLUDED.peso, ordenes_produccion.peso),
+          maquina_asignada = COALESCE(NULLIF(EXCLUDED.maquina_asignada, ''), ordenes_produccion.maquina_asignada);`,
+        [
+          numOrden, codProd, clienteFinal, descFinal,
+          cantProg, fechaPed, fechaEnt, rubro,
+          largoFinal, anchoFinal, plancha, m2Tot, m2Pend, peso,
+          rutaFinal
+        ]
+      );
+      procesados++;
+    }
+
+    res.json({
+      status: 'ok',
+      procesados,
+      omitidos,
+      mensaje: `Sincronización completada con éxito.\n✅ Órdenes procesadas: ${procesados}\n⚠️ Filas omitidas: ${omitidos}`
+    });
+  } catch (error) {
+    console.error('❌ Error en POST /api/pedidos/sincronizar:', error.message);
+    res.status(500).json({ error: 'Error al sincronizar pedidos: ' + error.message });
   }
 });
 
@@ -470,6 +623,26 @@ router.put('/reordenar', async (req, res) => {
 // =========================================================================
 // 7. RUTAS DINÁMICAS CON PARÁMETRO /:id (Estrictamente al final)
 // =========================================================================
+
+router.post('/:id/reprogramar-faltante', async (req, res) => {
+  const { id } = req.params;
+  const { cantidad_faltante } = req.body;
+  try {
+    const numOrden = parseInt(id, 10);
+    const saldo = Math.round(parseFloat(cantidad_faltante) || 0);
+    await db.query(
+      `UPDATE ordenes_produccion 
+       SET cantidad_programada = $1, 
+           cantidad_faltante = 0, 
+           estado = 'Pendiente' 
+       WHERE numero_orden = $2`,
+      [saldo, numOrden]
+    );
+    res.json({ status: 'ok', mensaje: 'Saldo pendiente reprogramado' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al reprogramar faltante: ' + error.message });
+  }
+});
 
 router.put('/:id/produccion', async (req, res) => {
   const { id } = req.params;
