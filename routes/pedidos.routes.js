@@ -148,40 +148,45 @@ router.put('/maquinas/:maquina/config-modo', async (req, res) => {
 });
 
 // 2. PUT: Estado en vivo desde PantallaMaquinista hacia PantallaMonitorTV
+// Variable global temporal o guardada en memoria para el estado vivo de máquinas
+if (!global.estadoVivoMaquinas) {
+  global.estadoVivoMaquinas = {};
+}
+
 router.put('/maquinas/:maquina/estado-vivo', async (req, res) => {
   const { maquina } = req.params;
-  const { estado, orden, operador, cajas, velocidad } = req.body;
+  const { estado, orden, operador, cajas, velocidad, segundos_fase } = req.body;
   
-  if (!global.estadoVivoMaquinas) global.estadoVivoMaquinas = {};
   const claveMaq = String(maquina || '').trim().toUpperCase();
 
+  // Guardamos incluyendo los segundos reales de la fase actual
   global.estadoVivoMaquinas[claveMaq] = {
     estado: estado || 'ESPERA',
     orden: orden || '',
     operador: operador || '',
     cajas: Number(cajas) || 0,
     velocidad: Number(velocidad) || 0,
+    segundos_fase: Number(segundos_fase) || 0, // 👈 CRUCIAL: Captura el cronómetro al segundo
     actualizado: new Date()
   };
 
-  console.log(`📡 [ESTADO VIVO] Máquina: ${claveMaq} -> Estado: ${estado} | Operador: ${operador || 'N/D'}`);
   res.json({ status: 'ok', estadoVivo: global.estadoVivoMaquinas[claveMaq] });
 });
 
-// 3. GET: Consultar estado en vivo (PantallaMonitorTV)
 router.get('/maquinas/:maquina/estado-vivo', async (req, res) => {
   const { maquina } = req.params;
-  if (!global.estadoVivoMaquinas) global.estadoVivoMaquinas = {};
   const claveMaq = String(maquina || '').trim().toUpperCase();
   
-  const vivo = global.estadoVivoMaquinas[claveMaq] || {
-    estado: 'ESPERA',
-    orden: '',
-    operador: '',
-    cajas: 0,
-    velocidad: 0
+  const estadoVivo = global.estadoVivoMaquinas[claveMaq] || { 
+    estado: 'ESPERA', 
+    orden: '', 
+    operador: '', 
+    cajas: 0, 
+    velocidad: 0, 
+    segundos_fase: 0 
   };
-  res.json(vivo);
+
+  res.json(estadoVivo);
 });
 
 // =========================================================================
@@ -363,16 +368,26 @@ router.get(['/tiempos-muertos/todos', '/tiempos-muertos'], async (req, res) => {
 });
 
 router.post('/tiempos-muertos', async (req, res) => {
-  const { maquina, codigo_parada, motivo, minutos_duracion, numero_orden } = req.body;
+  const { maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador } = req.body;
   try {
+    await db.query(`ALTER TABLE tiempos_muertos ADD COLUMN IF NOT EXISTS operador VARCHAR(100)`);
+    
     const result = await db.query(
-      `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, fecha_registro)
-       VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`,
-      [maquina, codigo_parada || motivo || 'PARADA', motivo || codigo_parada || 'Sin detalle', Number(minutos_duracion) || 0, numero_orden || null]
+      `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
+       VALUES ($1, $2, $3, $4::numeric, $5::int, $6, NOW()) RETURNING *`,
+      [
+        String(maquina || 'SIN_MAQUINA').substring(0, 50),
+        String(codigo_parada || motivo || 'PARADA').substring(0, 140),
+        String(motivo || codigo_parada || 'Sin detalle').substring(0, 240),
+        parseFloat(minutos_duracion) || 0,
+        numero_orden ? parseInt(numero_orden, 10) : null,
+        operador || 'Sin Operador'
+      ]
     );
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: 'Error al registrar tiempo muerto' });
+    console.error('❌ Error POST /tiempos-muertos:', error.message);
+    res.status(500).json({ error: 'Error al registrar tiempo muerto: ' + error.message });
   }
 });
 
@@ -384,12 +399,15 @@ router.get('/historial', async (req, res) => {
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion
       FROM ordenes_produccion o
       LEFT JOIN maestro_productos p ON TRIM(o.codigo_producto) = TRIM(p.codigo_producto)
-      WHERE TRIM(LOWER(o.estado)) IN ('finalizada', 'completada', 'terminada', 'cerrada')
+      WHERE TRIM(LOWER(o.estado)) IN ('finalizada', 'completada', 'terminada', 'cerrada', 'finalizada parcial', 'parcial')
       ORDER BY o.numero_orden DESC;
     `;
     const { rows } = await db.query(query);
     res.json(rows);
-  } catch (error) { res.json([]); }
+  } catch (error) { 
+    console.error('Error al obtener historial:', error.message);
+    res.json([]); 
+  }
 });
 
 // =========================================================================
@@ -676,12 +694,22 @@ router.put('/:id/produccion', async (req, res) => {
     );
 
     // 4. Registrar tiempos muertos si los hubo
+    // 4. Registrar tiempos muertos pendientes (solo los que no se hayan guardado ya en vivo)
     if (Array.isArray(paradas) && paradas.length > 0) {
+      await db.query(`ALTER TABLE tiempos_muertos ADD COLUMN IF NOT EXISTS operador VARCHAR(100)`);
       for (const p of paradas) {
+        if (p.guardadaEnBD) continue; // Evita duplicar si ya se envió en vivo
         await db.query(
-          `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, fecha_registro)
-           VALUES ($1, $2, $3, $4::numeric, $5::int, NOW())`,
-          [String(maquina || 'SIN_MAQUINA').substring(0, 50), String(p.codigo || 'PARADA').substring(0, 140), String(p.codigo || 'Sin detalle').substring(0, 240), parseFloat(p.minutos) || 0, numOrden]
+          `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
+           VALUES ($1, $2, $3, $4::numeric, $5::int, $6, NOW())`,
+          [
+            String(maquina || 'SIN_MAQUINA').substring(0, 50),
+            String(p.codigo || 'PARADA').substring(0, 140),
+            String(p.codigo || 'Sin detalle').substring(0, 240),
+            parseFloat(p.minutos ?? p.minutos_duracion) || 0,
+            numOrden,
+            p.operador || operador || 'General'
+          ]
         );
       }
     }
@@ -715,4 +743,4 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-module.exports = router;
+module.exports = router;      

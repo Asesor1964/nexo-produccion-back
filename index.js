@@ -18,6 +18,8 @@ const pedidosRoutes = require('./routes/pedidos.routes');
 const cipRoutes = require('./routes/cip.routes');
 const scrapRoutes = require('./routes/scrap.routes');
 const iotRoutes = require('./routes/iot.routes'); // 🤖 NUEVO: Cerebro independiente de Telemetría e IoT
+const expedicionRoutes = require('./routes/expedicion.routes');
+
 
 app.use('/api/auth', authRoutes);
 app.use('/api/cip', cipRoutes);
@@ -26,6 +28,7 @@ app.use('/api/pedidos', pedidosRoutes);
 app.use('/api', pedidosRoutes); 
 app.use('/api/scrap', scrapRoutes);
 app.use('/api/iot', iotRoutes);     // 🤖 NUEVO: Montado en su propio espacio seguro (/api/iot/...)
+app.use('/api/expedicion', expedicionRoutes);
 
 // Ruta de salud
 app.get('/api/health', async (req, res) => {
