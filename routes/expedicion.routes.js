@@ -29,23 +29,22 @@ const inicializarTablasExpedicion = async () => {
           fecha_actualizacion TIMESTAMP DEFAULT NOW()
       );
 
-      CREATE TABLE IF NOT EXISTS public.movimientos_expedicion (
-          id SERIAL PRIMARY KEY,
-          pallet_id INT REFERENCES public.pallets_produccion(id) ON DELETE SET NULL,
-          tipo_movimiento VARCHAR(30) NOT NULL,
-          numero_orden INT NOT NULL,
-          orden_destino INT,
-          cliente VARCHAR(150),
-          producto_descripcion TEXT,
-          unidades_afectadas NUMERIC NOT NULL,
-          m2_totales NUMERIC(12, 2) NOT NULL,
-          remito_transporte VARCHAR(100),
-          usuario VARCHAR(100),
-          detalle TEXT,
-          fecha_movimiento TIMESTAMP DEFAULT NOW()
-      );
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS operador VARCHAR(100);
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS cliente VARCHAR(150);
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS codigo_producto VARCHAR(100);
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS producto_descripcion TEXT;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS es_generico BOOLEAN DEFAULT FALSE;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS unidades_iniciales NUMERIC DEFAULT 0;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS cantidad_unidades NUMERIC DEFAULT 0;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS m2_unitario NUMERIC(10, 4) DEFAULT 0;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS es_parcial BOOLEAN DEFAULT FALSE;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS estado VARCHAR(30) DEFAULT 'En Galpón';
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS orden_origen INT;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS observaciones TEXT;
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS fecha_registro TIMESTAMP DEFAULT NOW();
+      ALTER TABLE public.pallets_produccion ADD COLUMN IF NOT EXISTS fecha_actualizacion TIMESTAMP DEFAULT NOW();
     `);
-    console.log('✅ Tablas pallets_produccion y movimientos_expedicion listas en la BD activa.');
+    console.log('✅ Tablas pallets_produccion y movimientos_expedicion listas y migradas en la BD activa.');
   } catch (err) {
     console.error('❌ Error al verificar/crear tablas de expedición:', err.message);
   }
