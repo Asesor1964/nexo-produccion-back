@@ -357,14 +357,16 @@ router.get('/recursos/paradas', async (req, res) => {
 });
 
 // =========================================================================
-// 4. TIEMPOS MUERTOS E HISTORIAL
+// 4. TIEMPOS MUERTOS E HISTORIAL (CRUD COMPLETO)
 // =========================================================================
 
 router.get(['/tiempos-muertos/todos', '/tiempos-muertos'], async (req, res) => {
   try {
     const result = await db.query('SELECT * FROM tiempos_muertos ORDER BY id DESC');
     res.json(result.rows);
-  } catch (error) { res.json([]); }
+  } catch (error) {
+    res.json([]);
+  }
 });
 
 router.post('/tiempos-muertos', async (req, res) => {
@@ -388,6 +390,50 @@ router.post('/tiempos-muertos', async (req, res) => {
   } catch (error) {
     console.error('❌ Error POST /tiempos-muertos:', error.message);
     res.status(500).json({ error: 'Error al registrar tiempo muerto: ' + error.message });
+  }
+});
+
+// ✏️ EDITAR TIEMPO MUERTO (Minutos y Motivo/Código de Parada)
+router.put('/tiempos-muertos/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { minutos_duracion, minutos, duracion, codigo_parada, motivo } = req.body;
+
+    // Acepta cualquiera de los nombres de propiedad que envíe el frontend
+    const nuevosMinutos = parseFloat(minutos_duracion ?? minutos ?? duracion) || 0;
+    const nuevoMotivo = String(motivo || codigo_parada || 'Sin detalle').substring(0, 240);
+    const nuevoCodigo = String(codigo_parada || motivo || 'PARADA').substring(0, 140);
+
+    const result = await db.query(
+      `UPDATE tiempos_muertos 
+       SET minutos_duracion = $1::numeric,
+           codigo_parada = $2,
+           motivo = $3
+       WHERE id = $4
+       RETURNING *`,
+      [nuevosMinutos, nuevoCodigo, nuevoMotivo, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Registro no encontrado' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('❌ Error PUT /tiempos-muertos/:id:', error.message);
+    res.status(500).json({ error: 'Error al actualizar tiempo muerto: ' + error.message });
+  }
+});
+
+// 🗑️ ELIMINAR TIEMPO MUERTO (Para el botón rojo del tachito en Auditoría)
+router.delete('/tiempos-muertos/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query('DELETE FROM tiempos_muertos WHERE id = $1', [id]);
+    res.json({ ok: true, mensaje: 'Registro eliminado correctamente' });
+  } catch (error) {
+    console.error('❌ Error DELETE /tiempos-muertos/:id:', error.message);
+    res.status(500).json({ error: 'Error al eliminar tiempo muerto: ' + error.message });
   }
 });
 
