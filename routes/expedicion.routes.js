@@ -91,20 +91,29 @@ router.get('/stock-fisico', async (req, res) => {
   }
 });
 
-// 1.3. OBTENER ÓRDENES PRODUCIDAS (Excluye las ya importadas)
+// 1.3. OBTENER ÓRDENES PRODUCIDAS (Incluye parciales, en curso o con unidades fabricadas)
 router.get('/ordenes-producidas', async (req, res) => {
   try {
     const query = `
       SELECT *
-      FROM public.ordenes_produccion
-      WHERE (LOWER(estado) IN ('finalizada', 'finalizada parcial', 'parcial', 'en producción', 'en produccion', 'pausada'))
-        AND numero_orden NOT IN (
-          SELECT DISTINCT numero_orden 
-          FROM public.pallets_produccion
-          WHERE numero_orden IS NOT NULL AND estado != 'Despachado'
-        )
-      ORDER BY numero_orden DESC
-      LIMIT 100
+      FROM public.ordenes_produccion o
+      WHERE (
+        COALESCE(NULLIF(REGEXP_REPLACE(o.cantidad_fabricada::text, '[^0-9.]', '', 'g'), ''), '0')::numeric > 0
+        OR LOWER(TRIM(o.estado)) LIKE '%finalizada%'
+        OR LOWER(TRIM(o.estado)) LIKE '%parcial%'
+        OR LOWER(TRIM(o.estado)) LIKE '%producci%'
+        OR LOWER(TRIM(o.estado)) LIKE '%pausa%'
+        OR LOWER(TRIM(o.estado)) LIKE '%proceso%'
+      )
+      AND NOT EXISTS (
+        SELECT 1 
+        FROM public.pallets_produccion p
+        WHERE p.numero_orden = o.numero_orden 
+          AND p.estado != 'Despachado'
+          AND p.cantidad_unidades > 0
+      )
+      ORDER BY o.numero_orden DESC
+      LIMIT 150
     `;
     const resultado = await db.query(query);
     res.json(resultado.rows);
