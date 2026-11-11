@@ -12,22 +12,20 @@ const extraerNucleoMaquina = (cod) => {
   if (!cod) return '';
   const texto = cod.toUpperCase().trim();
 
-  // 1. Mapeo directo de alias críticos de planta -> código real en CSV
-  if (texto.includes('WAR')) return 'WAR'; // Convierte "WARD", "WARD-TROQ", "COR-WARx2" -> "WAR"
-  if (texto.includes('JS'))  return 'JS';  // Convierte "COR-JS", "IMP-JS", "COR-JSx2" -> "JS"
-  if (texto.includes('SS'))  return 'SS';  // Convierte "COR-SS", "IMP-SS", "COR-SSx2" -> "SS"
-  if (texto.includes('PBO')) return 'PBO'; // Bobst / Pegadora PBO
-  if (texto.includes('PLM')) return 'PLM'; // Pegadora PLM
-  if (texto.includes('PEG')) return 'PEG'; // Pegado general
-  if (texto.includes('DIV')) return 'DIV'; // Divisora (DIV, COR-DIVx2)
-  if (texto.includes('TPL')) return 'TPL'; // Troqueladora Plana (TPLx2, TPLx4)
-  if (texto.includes('TER')) return 'TER'; // Termo / COR-TER
-  if (texto.includes('PLO')) return 'PLO'; // Plotter (COR-PLO)
-  if (texto.includes('TRA')) return 'TRA'; // Guillotina / Tramo (TRA)
-  if (texto.includes('DYF')) return 'DYF'; // DYF
-  if (texto.includes('CHI')) return 'CHI'; // CHI
+  if (texto.includes('WAR')) return 'WAR'; 
+  if (texto.includes('JS'))  return 'JS';  
+  if (texto.includes('SS'))  return 'SS';  
+  if (texto.includes('PBO')) return 'PBO'; 
+  if (texto.includes('PLM')) return 'PLM'; 
+  if (texto.includes('PEG')) return 'PEG'; 
+  if (texto.includes('DIV')) return 'DIV'; 
+  if (texto.includes('TPL')) return 'TPL'; 
+  if (texto.includes('TER')) return 'TER'; 
+  if (texto.includes('PLO')) return 'PLO'; 
+  if (texto.includes('TRA')) return 'TRA'; 
+  if (texto.includes('DYF')) return 'DYF'; 
+  if (texto.includes('CHI')) return 'CHI'; 
 
-  // 2. Limpieza general para futuras máquinas
   return texto
     .replace(/^(IMP-|COR-|TROQ-|TRO-|PEG-)/, '')
     .replace(/(-TROQ|-IMP|-COR|-PEG)$/, '')
@@ -39,7 +37,6 @@ const extraerNucleoMaquina = (cod) => {
 // 🚨 PRIORIDAD MÁXIMA: ESTADO EN VIVO Y CONFIGURACIÓN DE MÁQUINAS (DESARROLLADOR)
 // =========================================================================
 
-// 1. PUT: Guardar configuración desde PantallaDesarrollador (Rutas explícitas sin asteriscos)
 router.put([
   '/maquinas/:maquina',
   '/maquinas/:maquina/config',
@@ -54,15 +51,9 @@ router.put([
 
   const { maquina } = req.params;
   const { 
-    modo_captura, 
-    modo, 
-    modoAdquisicion,
-    velocidad_estandar, 
-    velocidad, 
-    velocidadEstandar,
-    tiempo_setup_min, 
-    tiempo_limite_setup, 
-    tiempoSetup 
+    modo_captura, modo, modoAdquisicion,
+    velocidad_estandar, velocidad, velocidadEstandar,
+    tiempo_setup_min, tiempo_limite_setup, tiempoSetup 
   } = req.body;
 
   const codMaq = String(maquina || '').trim().toUpperCase();
@@ -73,9 +64,7 @@ router.put([
   try {
     const updateRes = await db.query(
       `UPDATE maquinas 
-       SET modo_captura = $1, 
-           velocidad_estandar = $2, 
-           tiempo_setup_min = $3
+       SET modo_captura = $1, velocidad_estandar = $2, tiempo_setup_min = $3
        WHERE TRIM(UPPER(codigo_maquina)) = $4
        RETURNING *`,
       [modoFinal, velFinal, setupFinal, codMaq]
@@ -101,15 +90,11 @@ router.put([
   }
 });
 
-// PUT: Guardar configuración de ingeniería y modo desde PantallaDesarrollador (/config-modo)
 router.put('/maquinas/:maquina/config-modo', async (req, res) => {
   const { maquina } = req.params;
   const { 
-    modo_captura, 
-    velocidad_estandar, 
-    tiempo_setup_estandar,
-    tiempo_setup_min,
-    tiempo_limite_setup 
+    modo_captura, velocidad_estandar, 
+    tiempo_setup_estandar, tiempo_setup_min, tiempo_limite_setup 
   } = req.body;
 
   const codMaq = String(maquina || '').trim().toUpperCase();
@@ -120,9 +105,7 @@ router.put('/maquinas/:maquina/config-modo', async (req, res) => {
   try {
     const updateRes = await db.query(
       `UPDATE maquinas 
-       SET modo_captura = $1, 
-           velocidad_estandar = $2, 
-           tiempo_setup_min = $3
+       SET modo_captura = $1, velocidad_estandar = $2, tiempo_setup_min = $3
        WHERE TRIM(UPPER(codigo_maquina)) = $4
        RETURNING *`,
       [modoFinal, velFinal, setupFinal, codMaq]
@@ -147,26 +130,18 @@ router.put('/maquinas/:maquina/config-modo', async (req, res) => {
   }
 });
 
-// 2. PUT: Estado en vivo desde PantallaMaquinista hacia PantallaMonitorTV
-// Variable global temporal o guardada en memoria para el estado vivo de máquinas
-if (!global.estadoVivoMaquinas) {
-  global.estadoVivoMaquinas = {};
-}
-
 router.put('/maquinas/:maquina/estado-vivo', async (req, res) => {
   const { maquina } = req.params;
   const { estado, orden, operador, cajas, velocidad, segundos_fase } = req.body;
-  
   const claveMaq = String(maquina || '').trim().toUpperCase();
 
-  // Guardamos incluyendo los segundos reales de la fase actual
   global.estadoVivoMaquinas[claveMaq] = {
     estado: estado || 'ESPERA',
     orden: orden || '',
     operador: operador || '',
     cajas: Number(cajas) || 0,
     velocidad: Number(velocidad) || 0,
-    segundos_fase: Number(segundos_fase) || 0, // 👈 CRUCIAL: Captura el cronómetro al segundo
+    segundos_fase: Number(segundos_fase) || 0,
     actualizado: new Date()
   };
 
@@ -176,16 +151,9 @@ router.put('/maquinas/:maquina/estado-vivo', async (req, res) => {
 router.get('/maquinas/:maquina/estado-vivo', async (req, res) => {
   const { maquina } = req.params;
   const claveMaq = String(maquina || '').trim().toUpperCase();
-  
   const estadoVivo = global.estadoVivoMaquinas[claveMaq] || { 
-    estado: 'ESPERA', 
-    orden: '', 
-    operador: '', 
-    cajas: 0, 
-    velocidad: 0, 
-    segundos_fase: 0 
+    estado: 'ESPERA', orden: '', operador: '', cajas: 0, velocidad: 0, segundos_fase: 0 
   };
-
   res.json(estadoVivo);
 });
 
@@ -213,7 +181,6 @@ router.post('/recursos/operadores', async (req, res) => {
   try {
     const rolFinal = rol || 'Maquinista';
     await db.query(`ALTER TABLE operadores ADD COLUMN IF NOT EXISTS rol VARCHAR(30) DEFAULT 'Maquinista'`);
-    
     const result = await db.query(
       `INSERT INTO operadores (nombre, rol, estado) VALUES ($1, $2, 'Activo') RETURNING *`,
       [nombre, rolFinal]
@@ -373,7 +340,6 @@ router.post('/tiempos-muertos', async (req, res) => {
   const { maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador } = req.body;
   try {
     await db.query(`ALTER TABLE tiempos_muertos ADD COLUMN IF NOT EXISTS operador VARCHAR(100)`);
-    
     const result = await db.query(
       `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
        VALUES ($1, $2, $3, $4::numeric, $5::int, $6, NOW()) RETURNING *`,
@@ -393,24 +359,19 @@ router.post('/tiempos-muertos', async (req, res) => {
   }
 });
 
-// ✏️ EDITAR TIEMPO MUERTO (Minutos y Motivo/Código de Parada)
 router.put('/tiempos-muertos/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { minutos_duracion, minutos, duracion, codigo_parada, motivo } = req.body;
 
-    // Acepta cualquiera de los nombres de propiedad que envíe el frontend
     const nuevosMinutos = parseFloat(minutos_duracion ?? minutos ?? duracion) || 0;
     const nuevoMotivo = String(motivo || codigo_parada || 'Sin detalle').substring(0, 240);
     const nuevoCodigo = String(codigo_parada || motivo || 'PARADA').substring(0, 140);
 
     const result = await db.query(
       `UPDATE tiempos_muertos 
-       SET minutos_duracion = $1::numeric,
-           codigo_parada = $2,
-           motivo = $3
-       WHERE id = $4
-       RETURNING *`,
+       SET minutos_duracion = $1::numeric, codigo_parada = $2, motivo = $3
+       WHERE id = $4 RETURNING *`,
       [nuevosMinutos, nuevoCodigo, nuevoMotivo, id]
     );
 
@@ -425,7 +386,6 @@ router.put('/tiempos-muertos/:id', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR TIEMPO MUERTO (Para el botón rojo del tachito en Auditoría)
 router.delete('/tiempos-muertos/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -442,7 +402,14 @@ router.get('/historial', async (req, res) => {
     const query = `
       SELECT o.numero_orden AS id, o.*,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
-        COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion
+        COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
+        COALESCE(p.colores, '') AS colores,
+        COALESCE(p.color_1, '') AS color_1,
+        COALESCE(p.color_2, '') AS color_2,
+        COALESCE(p.color_3, '') AS color_3,
+        COALESCE(p.color_4, '') AS color_4,
+        COALESCE(p.color_5, '') AS color_5,
+        COALESCE(p.color_6, '') AS color_6
       FROM ordenes_produccion o
       LEFT JOIN maestro_productos p ON TRIM(o.codigo_producto) = TRIM(p.codigo_producto)
       WHERE TRIM(LOWER(o.estado)) IN ('finalizada', 'completada', 'terminada', 'cerrada', 'finalizada parcial', 'parcial')
@@ -457,7 +424,7 @@ router.get('/historial', async (req, res) => {
 });
 
 // =========================================================================
-// 5. COLA Y MONITOREO (Solo órdenes Habilitadas o En Producción)
+// 5. COLA Y MONITOREO (Incluyendo Colores de Maestro de Productos)
 // =========================================================================
 
 router.get('/cola/:maquina', async (req, res) => {
@@ -472,7 +439,14 @@ router.get('/cola/:maquina', async (req, res) => {
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
         COALESCE(o.largo, p.largo_mm, 800) AS largo_lamina_mm,
         COALESCE(o.ancho, p.ancho_mm, 600) AS ancho_lamina_mm,
-        COALESCE(o.m2_tot, 0) AS m2_totales_orden
+        COALESCE(o.m2_tot, 0) AS m2_totales_orden,
+        COALESCE(p.colores, '') AS colores,
+        COALESCE(p.color_1, '') AS color_1,
+        COALESCE(p.color_2, '') AS color_2,
+        COALESCE(p.color_3, '') AS color_3,
+        COALESCE(p.color_4, '') AS color_4,
+        COALESCE(p.color_5, '') AS color_5,
+        COALESCE(p.color_6, '') AS color_6
       FROM ordenes_produccion o
       LEFT JOIN maestro_productos p ON TRIM(o.codigo_producto) = TRIM(p.codigo_producto)
       WHERE 
@@ -503,14 +477,13 @@ router.get('/cola/:maquina', async (req, res) => {
 // 6. LISTADO GENERAL Y SINCRONIZACIÓN
 // =========================================================================
 
-// Funciones auxiliares para limpiar datos crudos de Procusto
 const formatearFechaParaPG = (fechaStr) => {
   if (!fechaStr) return null;
   const limpia = String(fechaStr).trim();
   if (!limpia) return null;
   const partes = limpia.split(/[\/\-]/);
   if (partes.length === 3) {
-    if (partes[0].length === 4) return limpia; // Ya es YYYY-MM-DD
+    if (partes[0].length === 4) return limpia;
     const dia = partes[0].padStart(2, '0');
     const mes = partes[1].padStart(2, '0');
     const anio = partes[2].length === 2 ? `20${partes[2]}` : partes[2];
@@ -534,7 +507,14 @@ router.get('/', async (req, res) => {
       SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia, COALESCE(o.cantidad_faltante, 0) AS cantidad_faltante,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
-        COALESCE(NULLIF(TRIM(o.maquina_asignada), ''), TRIM(UPPER(p.ruta_sugerida)), 'COR-JS') AS maquina_asignada
+        COALESCE(NULLIF(TRIM(o.maquina_asignada), ''), TRIM(UPPER(p.ruta_sugerida)), 'COR-JS') AS maquina_asignada,
+        COALESCE(p.colores, '') AS colores,
+        COALESCE(p.color_1, '') AS color_1,
+        COALESCE(p.color_2, '') AS color_2,
+        COALESCE(p.color_3, '') AS color_3,
+        COALESCE(p.color_4, '') AS color_4,
+        COALESCE(p.color_5, '') AS color_5,
+        COALESCE(p.color_6, '') AS color_6
       FROM ordenes_produccion o
       LEFT JOIN maestro_productos p ON TRIM(o.codigo_producto) = TRIM(p.codigo_producto)
       ORDER BY COALESCE(o.prioridad_secuencia, 9999) ASC, o.numero_orden DESC;
@@ -555,7 +535,6 @@ router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
   }
 
   try {
-    // 1. Blindaje preventivo de columnas en la tabla
     await db.query(`
       ALTER TABLE ordenes_produccion 
         ADD COLUMN IF NOT EXISTS cliente VARCHAR(150),
@@ -574,7 +553,6 @@ router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
         ADD COLUMN IF NOT EXISTS operador VARCHAR(100);
     `);
 
-    // 2. Cargamos el maestro de productos en memoria para cruce instantáneo
     const maestroRes = await db.query(
       'SELECT codigo_producto, cliente, descripcion, largo_mm, ancho_mm, ruta_sugerida FROM maestro_productos'
     );
@@ -588,12 +566,10 @@ router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
     let procesados = 0;
     let omitidos = 0;
 
-    // 3. Procesamos cada pedido individualmente con upsert seguro
     for (const item of listaPedidos) {
       const rawNum = item.numero_orden ?? item.numero ?? item.id;
       const numOrden = parseInt(String(rawNum || '').replace(/\./g, '').trim(), 10);
 
-      // Filtro estricto: N° de orden válido de planta (1 a 999999)
       if (!numOrden || isNaN(numOrden) || numOrden <= 0 || numOrden > 999999) {
         omitidos++;
         continue;
@@ -601,7 +577,6 @@ router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
 
       const cantProg = Math.round(parsearNumeroCSV(item.cantidad_programada ?? item.cantidad ?? 0) || 0);
       
-      // Filtro anti-basura: si la cantidad programada es 0 o menor, se omite
       if (cantProg <= 0) {
         omitidos++;
         continue;
@@ -628,6 +603,27 @@ router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
       const rutaFinal = rutaEsValida
         ? rutaCandidata
         : (maestroMatch.ruta_sugerida ? String(maestroMatch.ruta_sugerida).trim().toUpperCase() : 'COR-JS');
+
+      // Si el item trae colores desde el CSV de pedidos, también actualizamos el maestro de productos al vuelo
+      if (codProd && codProd !== 'SIN_CODIGO' && (item.colores || item.color_1)) {
+        await db.query(
+          `INSERT INTO maestro_productos (codigo_producto, cliente, descripcion, colores, color_1, color_2, color_3, color_4, color_5, color_6)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           ON CONFLICT (codigo_producto) DO UPDATE SET
+             colores = COALESCE(EXCLUDED.colores, maestro_productos.colores),
+             color_1 = COALESCE(EXCLUDED.color_1, maestro_productos.color_1),
+             color_2 = COALESCE(EXCLUDED.color_2, maestro_productos.color_2),
+             color_3 = COALESCE(EXCLUDED.color_3, maestro_productos.color_3),
+             color_4 = COALESCE(EXCLUDED.color_4, maestro_productos.color_4),
+             color_5 = COALESCE(EXCLUDED.color_5, maestro_productos.color_5),
+             color_6 = COALESCE(EXCLUDED.color_6, maestro_productos.color_6);`,
+          [
+            codProd, clienteFinal, descFinal,
+            item.colores || null, item.color_1 || null, item.color_2 || null,
+            item.color_3 || null, item.color_4 || null, item.color_5 || null, item.color_6 || null
+          ]
+        ).catch(() => {});
+      }
 
       await db.query(
         `INSERT INTO ordenes_produccion (
@@ -696,9 +692,7 @@ router.post('/:id/reprogramar-faltante', async (req, res) => {
     const saldo = Math.round(parseFloat(cantidad_faltante) || 0);
     await db.query(
       `UPDATE ordenes_produccion 
-       SET cantidad_programada = $1, 
-           cantidad_faltante = 0, 
-           estado = 'Pendiente' 
+       SET cantidad_programada = $1, cantidad_faltante = 0, estado = 'Pendiente' 
        WHERE numero_orden = $2`,
       [saldo, numOrden]
     );
@@ -715,7 +709,6 @@ router.put('/:id/produccion', async (req, res) => {
     const numOrden = parseInt(id, 10);
     const cantFab = parseFloat(cantidad_fabricada) || 0;
 
-    // 1. Consultar la orden original para comparar con la meta programada
     const ordenOrigRes = await db.query('SELECT * FROM ordenes_produccion WHERE numero_orden = $1', [numOrden]);
     if (ordenOrigRes.rows.length === 0) {
       return res.status(404).json({ error: 'Orden no encontrada' });
@@ -723,28 +716,21 @@ router.put('/:id/produccion', async (req, res) => {
     const ordenOriginal = ordenOrigRes.rows[0];
     const metaProgramada = parseFloat(ordenOriginal.cantidad_programada) || 0;
 
-    // 2. Evaluar si hubo faltante
     const hayFaltante = cantFab < metaProgramada;
     const unidadesFaltantes = hayFaltante ? (metaProgramada - cantFab) : 0;
     const estadoFinal = hayFaltante ? 'Finalizada Parcial' : 'Finalizada';
 
-    // 3. Actualizar la orden en la BD guardando la cantidad fabricada y el faltante
     await db.query(
       `UPDATE ordenes_produccion 
-       SET estado = $1, 
-           cantidad_fabricada = $2::numeric, 
-           operador = $3,
-           cantidad_faltante = $4::numeric 
+       SET estado = $1, cantidad_fabricada = $2::numeric, operador = $3, cantidad_faltante = $4::numeric 
        WHERE numero_orden = $5::int`,
       [estadoFinal, cantFab, operador || 'General', unidadesFaltantes, numOrden]
     );
 
-    // 4. Registrar tiempos muertos si los hubo
-    // 4. Registrar tiempos muertos pendientes (solo los que no se hayan guardado ya en vivo)
     if (Array.isArray(paradas) && paradas.length > 0) {
       await db.query(`ALTER TABLE tiempos_muertos ADD COLUMN IF NOT EXISTS operador VARCHAR(100)`);
       for (const p of paradas) {
-        if (p.guardadaEnBD) continue; // Evita duplicar si ya se envió en vivo
+        if (p.guardadaEnBD) continue;
         await db.query(
           `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
            VALUES ($1, $2, $3, $4::numeric, $5::int, $6, NOW())`,
@@ -789,4 +775,4 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-module.exports = router;      
+module.exports = router;

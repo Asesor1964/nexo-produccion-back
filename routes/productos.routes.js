@@ -4,18 +4,21 @@ const db = require('../db');
 
 // 🛡️ Auto-migración para asegurar que maestro_productos tenga las columnas de colores
 const asegurarColumnasColores = async () => {
-  try {
-    await db.query(`
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS colores TEXT;
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS color_1 VARCHAR(100);
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS color_2 VARCHAR(100);
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS color_3 VARCHAR(100);
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS color_4 VARCHAR(100);
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS color_5 VARCHAR(100);
-      ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS color_6 VARCHAR(100);
-    `);
-  } catch (err) {
-    console.error('Aviso al verificar columnas de colores en maestro_productos:', err.message);
+  const columnas = [
+    'colores TEXT',
+    'color_1 VARCHAR(100)',
+    'color_2 VARCHAR(100)',
+    'color_3 VARCHAR(100)',
+    'color_4 VARCHAR(100)',
+    'color_5 VARCHAR(100)',
+    'color_6 VARCHAR(100)'
+  ];
+  for (const col of columnas) {
+    try {
+      await db.query(`ALTER TABLE public.maestro_productos ADD COLUMN IF NOT EXISTS ${col}`);
+    } catch (err) {
+      console.error(`Aviso al verificar columna ${col}:`, err.message);
+    }
   }
 };
 asegurarColumnasColores();
