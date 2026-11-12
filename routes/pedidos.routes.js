@@ -819,4 +819,171 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// =========================================================================
+// 8. CARGA MANUAL HISTÓRICA DE PARTES FÍSICOS (JEFE DE PRODUCCIÓN)
+// =========================================================================
+router.post('/:id/carga-manual-historica', async (req, res) => {
+  const { id } = req.params;
+  const {
+    fecha_produccion, // YYYY-MM-DD
+    turno,
+    maquina,
+    operador,
+    supervisor,
+    cantidad_fabricada,
+    estado_cierre, // 'Finalizada', 'Finalizada Parcial', 'Cerrado por Acuerdo'
+    minutos_setup,
+    paradas, // [{ codigo, motivo, minutos }]
+    incluir_cip,
+    datos_cip
+  } = req.body;
+
+  try {
+    const numOrden = parseInt(id, 10);
+    const cantFab = parseFloat(cantidad_fabricada) || 0;
+    const maqFinal = String(maquina || 'COR-JS').trim().toUpperCase();
+    const opFinal = String(operador || 'Operador Planta').trim();
+    const turnoFinal = String(turno || 'M').trim();
+
+    // Aseguramos columnas de auditoría histórica en ordenes_produccion
+    await db.query(`
+      ALTER TABLE ordenes_produccion 
+        ADD COLUMN IF NOT EXISTS fecha_produccion DATE,
+        ADD COLUMN IF NOT EXISTS turno VARCHAR(10),
+        ADD COLUMN IF NOT EXISTS operador VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS cantidad_fabricada NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cantidad_faltante NUMERIC DEFAULT 0;
+    `);
+
+    const ordenOrigRes = await db.query('SELECT * FROM ordenes_produccion WHERE numero_orden = $1', [numOrden]);
+    if (ordenOrigRes.rows.length === 0) {
+      return res.status(404).json({ error: `La orden #${numOrden} no existe en la base de datos.` });
+    }
+
+    const ordenOriginal = ordenOrigRes.rows[0];
+    const metaProgramada = parseFloat(ordenOriginal.cantidad_programada) || 0;
+    const faltanteCalculado = Math.max(0, metaProgramada - cantFab);
+
+    let estadoFinal = estado_cierre;
+    if (!estadoFinal) {
+      estadoFinal = (cantFab < metaProgramada && cantFab > 0) ? 'Finalizada Parcial' : 'Finalizada';
+    }
+
+    const fechaProdFinal = fecha_produccion || new Date().toISOString().split('T')[0];
+
+    // 1. Actualizar la orden de producción con los datos reales de la planilla física
+    const updateOrden = await db.query(
+      `UPDATE ordenes_produccion
+       SET estado = $1,
+           maquina_asignada = $2,
+           operador = $3,
+           turno = $4,
+           fecha_produccion = $5::date,
+           cantidad_fabricada = $6::numeric,
+           cantidad_faltante = $7::numeric
+       WHERE numero_orden = $8::int
+       RETURNING *`,
+      [
+        estadoFinal,
+        maqFinal,
+        opFinal,
+        turnoFinal,
+        fechaProdFinal,
+        cantFab,
+        estadoFinal === 'Finalizada' || estadoFinal === 'Cerrado por Acuerdo' ? 0 : faltanteCalculado,
+        numOrden
+      ]
+    );
+
+    // 2. Registrar el Set-Up y los Tiempos Muertos con la fecha histórica elegida
+    await db.query(`ALTER TABLE tiempos_muertos ADD COLUMN IF NOT EXISTS operador VARCHAR(100)`);
+    
+    // Limpiamos paradas previas de esta misma orden si se está re-cargando el parte para no duplicar
+    if (req.body.reemplazar_paradas_previas) {
+      await db.query('DELETE FROM tiempos_muertos WHERE numero_orden = $1', [numOrden]);
+    }
+
+    const fechaHoraRegistro = `${fechaProdFinal} 12:00:00`;
+
+    // Si informó minutos de Set-Up en la planilla, lo insertamos como registro SET-UP
+    const minSetup = parseFloat(minutos_setup) || 0;
+    if (minSetup > 0) {
+      await db.query(
+        `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
+         VALUES ($1, 'SET-UP', 'SET-UP / CAMBIO DE ORDEN (CARGA MANUAL)', $2::numeric, $3::int, $4, $5::timestamp)`,
+        [maqFinal, minSetup, numOrden, opFinal, fechaHoraRegistro]
+      );
+    }
+
+    // Insertar cada parada anotada en la planilla física
+    if (Array.isArray(paradas) && paradas.length > 0) {
+      for (const p of paradas) {
+        const minParada = parseFloat(p.minutos) || 0;
+        if (minParada <= 0) continue;
+        const cod = String(p.codigo || p.motivo || 'PARADA').substring(0, 140);
+        const mot = String(p.motivo || p.codigo || 'Sin detalle').substring(0, 240);
+
+        await db.query(
+          `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
+           VALUES ($1, $2, $3, $4::numeric, $5::int, $6, $7::timestamp)`,
+          [maqFinal, cod, mot, minParada, numOrden, opFinal, fechaHoraRegistro]
+        );
+      }
+    }
+
+    // 3. Si tildó "Adjuntar Planilla CIP RE-PRO 009", guardamos también el protocolo CIP
+    if (incluir_cip && datos_cip) {
+      const dc = datos_cip;
+      const td = {
+        tinta1: { color: dc.tinta1Color || '', lote: dc.tinta1Lote || '' },
+        tinta2: { color: dc.tinta2Color || '', lote: dc.tinta2Lote || '' },
+        tinta3: { color: dc.tinta3Color || '', lote: dc.tinta3Lote || '' },
+        tinta4: { color: dc.tinta4Color || '', lote: dc.tinta4Lote || '' },
+        tinta5: { color: dc.tinta5Color || '', lote: dc.tinta5Lote || '' },
+        tinta6: { color: dc.tinta6Color || '', lote: dc.tinta6Lote || '' }
+      };
+
+      await db.query(
+        `INSERT INTO public.control_proceso_conversion (
+          numero_orden, operador, supervisor, turno, maquina,
+          tipo_onda, tipo_chapeton, hendido_desplazado, liner_externo, tipo_cierre,
+          tintas_detalle, verificacion_items, inspeccion_paquetes,
+          tinta_1_color, tinta_1_lote, tinta_2_color, tinta_2_lote,
+          tinta_3_color, tinta_3_lote, tinta_4_color, tinta_4_lote,
+          tinta_5_color, tinta_5_lote, tinta_6_color, tinta_6_lote,
+          observaciones
+        ) VALUES (
+          $1, $2, $3, $4, $5,
+          $6, 'Normal', false, $7, $8,
+          $9::jsonb, $10::jsonb, '[]'::jsonb,
+          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+          $23
+        )`,
+        [
+          numOrden, opFinal, supervisor || dc.supervisor || 'SERGIO SANCHEZ', turnoFinal, maqFinal,
+          dc.tipoOnda || 'CB', dc.linerExterno || 'Kraft', dc.tipoCierre || 'Pegado',
+          JSON.stringify(td), JSON.stringify(dc.verificacion || {}),
+          dc.tinta1Color || '', dc.tinta1Lote || '',
+          dc.tinta2Color || '', dc.tinta2Lote || '',
+          dc.tinta3Color || '', dc.tinta3Lote || '',
+          dc.tinta4Color || '', dc.tinta4Lote || '',
+          dc.tinta5Color || '', dc.tinta5Lote || '',
+          dc.tinta6Color || '', dc.tinta6Lote || '',
+          dc.observaciones || 'Cargado desde Parte Físico Manual'
+        ]
+      );
+    }
+
+    console.log(`📋 [PARTE MANUAL] Orden #${numOrden} registrada con fecha ${fechaProdFinal} (${cantFab} cajas).`);
+    res.json({
+      status: 'ok',
+      mensaje: `Parte físico de la Orden #${numOrden} guardado con éxito.`,
+      orden: updateOrden.rows[0]
+    });
+  } catch (error) {
+    console.error('❌ Error en carga manual histórica:', error.message);
+    res.status(500).json({ error: 'Error al registrar el parte manual: ' + error.message });
+  }
+});
+
 module.exports = router;
