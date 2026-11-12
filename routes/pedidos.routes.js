@@ -7,6 +7,29 @@ if (!global.estadoVivoMaquinas) {
   global.estadoVivoMaquinas = {};
 }
 
+// Inicialización automática de la tabla de Turnos Reales de Máquina para OEE
+const asegurarTablaTurnos = async () => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS turnos_maquina (
+        id SERIAL PRIMARY KEY,
+        maquina VARCHAR(50) NOT NULL,
+        operador VARCHAR(100) NOT NULL,
+        etiqueta_turno VARCHAR(80),
+        fecha_inicio TIMESTAMP DEFAULT NOW(),
+        fecha_fin TIMESTAMP,
+        hora_inicio VARCHAR(20),
+        hora_fin VARCHAR(20),
+        minutos_totales NUMERIC DEFAULT 0,
+        estado VARCHAR(20) DEFAULT 'ABIERTO'
+      );
+    `);
+  } catch (err) {
+    console.error('Error asegurando tabla turnos_maquina:', err.message);
+  }
+};
+asegurarTablaTurnos();
+
 // Función auxiliar blindada según las rutas reales de Maestro_Productos.csv
 const extraerNucleoMaquina = (cod) => {
   if (!cod) return '';
@@ -155,6 +178,101 @@ router.get('/maquinas/:maquina/estado-vivo', async (req, res) => {
     estado: 'ESPERA', orden: '', operador: '', cajas: 0, velocidad: 0, segundos_fase: 0 
   };
   res.json(estadoVivo);
+});
+
+// =========================================================================
+// ⏱️ GESTIÓN DE TURNOS REALES DE MÁQUINA (APERTURA Y CIERRE PARA OEE EXACTO)
+// =========================================================================
+
+router.get(['/turnos/todos', '/turnos'], async (req, res) => {
+  try {
+    await asegurarTablaTurnos();
+    const result = await db.query(`
+      SELECT *,
+        CASE 
+          WHEN estado = 'ABIERTO' THEN LEAST(480, GREATEST(1, ROUND(EXTRACT(EPOCH FROM (NOW() - fecha_inicio)) / 60)))
+          ELSE COALESCE(minutos_totales, 0)
+        END AS minutos_efectivos
+      FROM turnos_maquina
+      ORDER BY fecha_inicio DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error GET /turnos:', error.message);
+    res.json([]);
+  }
+});
+
+router.post('/turnos/iniciar', async (req, res) => {
+  const { maquina, operador, etiqueta_turno, hora_inicio } = req.body;
+  try {
+    await asegurarTablaTurnos();
+    const codMaq = String(maquina || 'SIN_MAQUINA').trim().toUpperCase();
+
+    // Seguro anti-olvido: si había un turno abierto previo en la misma máquina, lo cierra con tope máximo de 480 min (8 hs)
+    await db.query(`
+      UPDATE turnos_maquina
+      SET 
+        estado = 'CERRADO',
+        fecha_fin = NOW(),
+        hora_fin = COALESCE(hora_fin, 'Auto-Cierre'),
+        minutos_totales = LEAST(480, GREATEST(1, ROUND(EXTRACT(EPOCH FROM (NOW() - fecha_inicio)) / 60)))
+      WHERE TRIM(UPPER(maquina)) = $1 AND estado = 'ABIERTO'
+    `, [codMaq]);
+
+    const result = await db.query(
+      `INSERT INTO turnos_maquina (maquina, operador, etiqueta_turno, fecha_inicio, hora_inicio, minutos_totales, estado)
+       VALUES ($1, $2, $3, NOW(), $4, 0, 'ABIERTO')
+       RETURNING *`,
+      [codMaq, operador || 'Sin Operador', etiqueta_turno || 'Turno Planta', hora_inicio || '']
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('❌ Error POST /turnos/iniciar:', error.message);
+    res.status(500).json({ error: 'Error al iniciar turno: ' + error.message });
+  }
+});
+
+router.put('/turnos/finalizar', async (req, res) => {
+  const { id, maquina, operador, hora_fin, minutos_totales } = req.body;
+  try {
+    await asegurarTablaTurnos();
+    const mins = Math.min(720, Math.max(1, Number(minutos_totales) || 1));
+
+    if (id) {
+      const resById = await db.query(
+        `UPDATE turnos_maquina
+         SET estado = 'CERRADO', fecha_fin = NOW(), hora_fin = $1, minutos_totales = $2
+         WHERE id = $3
+         RETURNING *`,
+        [hora_fin || '', mins, id]
+      );
+      if (resById.rows.length > 0) return res.json(resById.rows[0]);
+    }
+
+    const codMaq = String(maquina || '').trim().toUpperCase();
+    const resByMaq = await db.query(
+      `UPDATE turnos_maquina
+       SET estado = 'CERRADO', fecha_fin = NOW(), hora_fin = $1, minutos_totales = $2
+       WHERE TRIM(UPPER(maquina)) = $3 AND estado = 'ABIERTO'
+       RETURNING *`,
+      [hora_fin || '', mins, codMaq]
+    );
+
+    if (resByMaq.rows.length > 0) return res.json(resByMaq.rows[0]);
+
+    // Si no existía fila previa abierta, inserta el turno cerrado directamente
+    const insertCerrado = await db.query(
+      `INSERT INTO turnos_maquina (maquina, operador, etiqueta_turno, fecha_inicio, fecha_fin, hora_fin, minutos_totales, estado)
+       VALUES ($1, $2, 'Turno Registrado', NOW() - ($3 || ' minutes')::interval, NOW(), $4, $3, 'CERRADO')
+       RETURNING *`,
+      [codMaq || 'PLANTA', operador || 'Sin Operador', mins, hora_fin || '']
+    );
+    res.json(insertCerrado.rows[0]);
+  } catch (error) {
+    console.error('❌ Error PUT /turnos/finalizar:', error.message);
+    res.status(500).json({ error: 'Error al finalizar turno: ' + error.message });
+  }
 });
 
 // =========================================================================
@@ -455,10 +573,10 @@ router.get('/cola/:maquina', async (req, res) => {
           OR TRIM(UPPER($1)) LIKE '%' || TRIM(UPPER(NULLIF(o.maquina_asignada, ''))) || '%'
           OR ($2 <> '' AND TRIM(UPPER(o.maquina_asignada)) LIKE '%' || $2 || '%')
         )
-        AND TRIM(LOWER(COALESCE(o.estado, ''))) IN ('habilitada', 'en produccion', 'en producción')
+        AND TRIM(LOWER(COALESCE(o.estado, ''))) IN ('habilitada', 'en produccion', 'en producción', 'en proceso')
       ORDER BY 
         CASE 
-          WHEN TRIM(LOWER(o.estado)) IN ('en produccion', 'en producción') THEN 0 
+          WHEN TRIM(LOWER(o.estado)) IN ('en produccion', 'en producción', 'en proceso') THEN 0 
           WHEN TRIM(LOWER(o.estado)) = 'habilitada' THEN 1 
           ELSE 2 
         END,
@@ -504,7 +622,7 @@ const parsearNumeroCSV = (val) => {
 router.get('/', async (req, res) => {
   try {
     const query = `
-      SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia, COALESCE(o.cantidad_faltante, 0) AS cantidad_faltante,
+      SELECT o.numero_orden AS id, o.numero_orden, o.codigo_producto, o.cantidad_programada, o.cantidad_fabricada, o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia, COALESCE(o.cantidad_faltante, 0) AS cantidad_faltante,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
         COALESCE(NULLIF(TRIM(o.maquina_asignada), ''), TRIM(UPPER(p.ruta_sugerida)), 'COR-JS') AS maquina_asignada,
@@ -604,7 +722,6 @@ router.post(['/sincronizar', '/importar', '/cargar-csv'], async (req, res) => {
         ? rutaCandidata
         : (maestroMatch.ruta_sugerida ? String(maestroMatch.ruta_sugerida).trim().toUpperCase() : 'COR-JS');
 
-      // Si el item trae colores desde el CSV de pedidos, también actualizamos el maestro de productos al vuelo
       if (codProd && codProd !== 'SIN_CODIGO' && (item.colores || item.color_1)) {
         await db.query(
           `INSERT INTO maestro_productos (codigo_producto, cliente, descripcion, colores, color_1, color_2, color_3, color_4, color_5, color_6)
@@ -716,9 +833,21 @@ router.put('/:id/produccion', async (req, res) => {
     const ordenOriginal = ordenOrigRes.rows[0];
     const metaProgramada = parseFloat(ordenOriginal.cantidad_programada) || 0;
 
-    const hayFaltante = cantFab < metaProgramada;
-    const unidadesFaltantes = hayFaltante ? (metaProgramada - cantFab) : 0;
-    const estadoFinal = hayFaltante ? 'Finalizada Parcial' : 'Finalizada';
+    // 🔄 SOPORTE PARA RELEVO DE TURNO (14:00 HS): Si el estado enviado es 'En Producción', mantiene la orden en la máquina con el avance acumulado
+    const estadoNormalizado = String(estado || '').trim().toLowerCase();
+    const esRelevoEnCurso = ['en produccion', 'en producción', 'en proceso'].includes(estadoNormalizado);
+
+    let estadoFinal = 'Finalizada';
+    let unidadesFaltantes = 0;
+
+    if (esRelevoEnCurso) {
+      estadoFinal = 'En Producción';
+      unidadesFaltantes = 0;
+    } else {
+      const hayFaltante = cantFab < metaProgramada;
+      unidadesFaltantes = hayFaltante ? (metaProgramada - cantFab) : 0;
+      estadoFinal = (estado === 'Finalizada Parcial' || hayFaltante) ? 'Finalizada Parcial' : 'Finalizada';
+    }
 
     await db.query(
       `UPDATE ordenes_produccion 
@@ -748,15 +877,18 @@ router.put('/:id/produccion', async (req, res) => {
 
     if (maquina && global.estadoVivoMaquinas) {
       global.estadoVivoMaquinas[maquina.toUpperCase()] = {
-        estado: 'ESPERA', orden: '', operador: operador || '', cajas: 0, velocidad: 0, actualizado: new Date()
+        estado: 'ESPERA', orden: esRelevoEnCurso ? numOrden : '', operador: operador || '', cajas: cantFab, velocidad: 0, actualizado: new Date()
       };
     }
 
     res.json({ 
       status: 'ok', 
-      mensaje: hayFaltante 
-        ? `Orden cerrada parcialmente. Faltante registrado: ${unidadesFaltantes} cajas pendientes.` 
-        : 'Orden finalizada correctamente' 
+      estado: estadoFinal,
+      mensaje: esRelevoEnCurso
+        ? `Avance de relevo guardado (${cantFab} u.). La orden continúa en máquina para el siguiente turno.`
+        : (unidadesFaltantes > 0
+            ? `Orden cerrada parcialmente. Faltante registrado: ${unidadesFaltantes} cajas pendientes.` 
+            : 'Orden finalizada correctamente')
     });
   } catch (error) {
     res.status(500).json({ error: 'Error al finalizar la orden en BD: ' + error.message });
