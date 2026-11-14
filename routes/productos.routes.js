@@ -3,7 +3,6 @@ const router = express.Router();
 const db = require('../db');
 const { poblarInventarioDesdeMaestro } = require('./herramentales.routes');
 
-// 🛡️ Auto-migración para asegurar que maestro_productos tenga las columnas de colores y herramentales
 const asegurarColumnasMaestro = async () => {
   const columnas = [
     'colores TEXT',
@@ -30,7 +29,6 @@ const asegurarColumnasMaestro = async () => {
 };
 asegurarColumnasMaestro();
 
-// POST: Sincronizar / Importar lotes de Maestro de Productos (Incluyendo Colores, Clisés y Troqueles)
 router.post('/sincronizar', async (req, res) => {
   const { productos } = req.body;
 
@@ -51,6 +49,8 @@ router.post('/sincronizar', async (req, res) => {
         plano, troquel, ubic_troquel, clise, ubic_clise, bocas
       } = prod;
 
+      if (!codigo_producto) continue;
+
       const textoColores = prod.colores || prod.tintas || prod.receta_colores || '';
       const listaColores = textoColores
         ? String(textoColores).split(/[,;/]/).map(c => c.trim()).filter(Boolean)
@@ -64,7 +64,9 @@ router.post('/sincronizar', async (req, res) => {
       const c6 = prod.color_6 || prod.color6 || prod.tinta_6 || prod.tinta6 || listaColores[5] || null;
 
       const resumenColores = textoColores || [c1, c2, c3, c4, c5, c6].filter(Boolean).join(', ') || null;
+      const bocasNum = bocas !== undefined && bocas !== null && bocas !== '' ? parseInt(bocas, 10) : null;
 
+      // 🛡️ BLINDAJE TOTAL: COALESCE evita que una actualización parcial borre datos ya existentes
       const query = `
         INSERT INTO maestro_productos (
           codigo_producto, cliente, descripcion, material,
@@ -72,39 +74,49 @@ router.post('/sincronizar', async (req, res) => {
           colores, color_1, color_2, color_3, color_4, color_5, color_6,
           plano, troquel, ubic_troquel, clise, ubic_clise, bocas
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, COALESCE($22, 1))
         ON CONFLICT (codigo_producto) DO UPDATE SET
-          cliente = EXCLUDED.cliente,
-          descripcion = EXCLUDED.descripcion,
-          material = EXCLUDED.material,
-          largo_mm = EXCLUDED.largo_mm,
-          ancho_mm = EXCLUDED.ancho_mm,
-          superficie_m2 = EXCLUDED.superficie_m2,
-          herramientas = EXCLUDED.herramientas,
-          ruta_sugerida = EXCLUDED.ruta_sugerida,
-          colores = COALESCE(EXCLUDED.colores, maestro_productos.colores),
-          color_1 = COALESCE(EXCLUDED.color_1, maestro_productos.color_1),
-          color_2 = COALESCE(EXCLUDED.color_2, maestro_productos.color_2),
-          color_3 = COALESCE(EXCLUDED.color_3, maestro_productos.color_3),
-          color_4 = COALESCE(EXCLUDED.color_4, maestro_productos.color_4),
-          color_5 = COALESCE(EXCLUDED.color_5, maestro_productos.color_5),
-          color_6 = COALESCE(EXCLUDED.color_6, maestro_productos.color_6),
-          plano = COALESCE(EXCLUDED.plano, maestro_productos.plano),
-          troquel = COALESCE(EXCLUDED.troquel, maestro_productos.troquel),
-          ubic_troquel = COALESCE(EXCLUDED.ubic_troquel, maestro_productos.ubic_troquel),
-          clise = COALESCE(EXCLUDED.clise, maestro_productos.clise),
-          ubic_clise = COALESCE(EXCLUDED.ubic_clise, maestro_productos.ubic_clise),
-          bocas = COALESCE(EXCLUDED.bocas, maestro_productos.bocas),
+          cliente = COALESCE(NULLIF(EXCLUDED.cliente, ''), maestro_productos.cliente),
+          descripcion = COALESCE(NULLIF(EXCLUDED.descripcion, ''), maestro_productos.descripcion),
+          material = COALESCE(NULLIF(EXCLUDED.material, ''), maestro_productos.material),
+          largo_mm = COALESCE(EXCLUDED.largo_mm, maestro_productos.largo_mm),
+          ancho_mm = COALESCE(EXCLUDED.ancho_mm, maestro_productos.ancho_mm),
+          superficie_m2 = COALESCE(EXCLUDED.superficie_m2, maestro_productos.superficie_m2),
+          herramientas = COALESCE(NULLIF(EXCLUDED.herramientas, ''), maestro_productos.herramientas),
+          ruta_sugerida = COALESCE(NULLIF(EXCLUDED.ruta_sugerida, ''), maestro_productos.ruta_sugerida),
+          colores = COALESCE(NULLIF(EXCLUDED.colores, ''), maestro_productos.colores),
+          color_1 = COALESCE(NULLIF(EXCLUDED.color_1, ''), maestro_productos.color_1),
+          color_2 = COALESCE(NULLIF(EXCLUDED.color_2, ''), maestro_productos.color_2),
+          color_3 = COALESCE(NULLIF(EXCLUDED.color_3, ''), maestro_productos.color_3),
+          color_4 = COALESCE(NULLIF(EXCLUDED.color_4, ''), maestro_productos.color_4),
+          color_5 = COALESCE(NULLIF(EXCLUDED.color_5, ''), maestro_productos.color_5),
+          color_6 = COALESCE(NULLIF(EXCLUDED.color_6, ''), maestro_productos.color_6),
+          plano = COALESCE(NULLIF(EXCLUDED.plano, ''), maestro_productos.plano),
+          troquel = COALESCE(NULLIF(EXCLUDED.troquel, ''), maestro_productos.troquel),
+          ubic_troquel = COALESCE(NULLIF(EXCLUDED.ubic_troquel, ''), maestro_productos.ubic_troquel),
+          clise = COALESCE(NULLIF(EXCLUDED.clise, ''), maestro_productos.clise),
+          ubic_clise = COALESCE(NULLIF(EXCLUDED.ubic_clise, ''), maestro_productos.ubic_clise),
+          bocas = COALESCE($22, maestro_productos.bocas, 1),
           fecha_actualizacion = CURRENT_TIMESTAMP;
       `;
 
       const values = [
-        codigo_producto, cliente, descripcion, material || null,
-        largo_mm || null, ancho_mm || null, superficie_m2 || null,
-        herramientas || null, ruta_sugerida ? ruta_sugerida.trim() : null,
+        String(codigo_producto).trim(),
+        cliente || null,
+        descripcion || null,
+        material || null,
+        largo_mm || null,
+        ancho_mm || null,
+        superficie_m2 || null,
+        herramientas || null,
+        ruta_sugerida ? ruta_sugerida.trim() : null,
         resumenColores, c1, c2, c3, c4, c5, c6,
-        plano || null, troquel || null, ubic_troquel || null,
-        clise || null, ubic_clise || null, parseInt(bocas, 10) || 1
+        plano || null,
+        troquel || null,
+        ubic_troquel || null,
+        clise || null,
+        ubic_clise || null,
+        bocasNum
       ];
 
       try {
@@ -131,18 +143,18 @@ router.post('/sincronizar', async (req, res) => {
 
     const nuevasRutas = rutasRes.rowCount || 0;
 
-    // 🛠️ Poblar automáticamente el inventario de Clisés y Troqueles
+    // Sincronizamos el inventario de Clisés y Troqueles
     let resumenHerramentales = '';
     try {
       const { troquelesSinc, clisesSinc } = await poblarInventarioDesdeMaestro();
-      resumenHerramentales = `\n🔪 Troqueles sincronizados: ${troquelesSinc}\n🎨 Clisés sincronizados: ${clisesSinc}`;
+      resumenHerramentales = `\n🔪 Troqueles actualizados: ${troquelesSinc}\n🎨 Clisés actualizados: ${clisesSinc}`;
     } catch (e) {
       console.error('Aviso sincronizando herramentales:', e.message);
     }
 
     res.json({ 
       status: 'ok', 
-      mensaje: `Sincronización completada.\n✅ Productos procesados: ${insertados}\n🛣️ Nuevas rutas detectadas y agregadas: ${nuevasRutas}${resumenHerramentales}\n⚠️ Omitidos: ${omitidos}` 
+      mensaje: `Sincronización completada.\n✅ Productos procesados: ${insertados}\n🛣️ Nuevas rutas detectadas: ${nuevasRutas}${resumenHerramentales}\n⚠️ Omitidos: ${omitidos}` 
     });
   } catch (error) {
     console.error('Error al sincronizar productos:', error);
@@ -150,7 +162,6 @@ router.post('/sincronizar', async (req, res) => {
   }
 });
 
-// GET: Obtener todos los productos
 router.get('/', async (req, res) => {
   try {
     const result = await db.query('SELECT * FROM maestro_productos ORDER BY codigo_producto ASC');
@@ -160,12 +171,11 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET: Obtener un producto específico por codigo_producto
 router.get('/:codigo_producto', async (req, res) => {
   try {
     const { codigo_producto } = req.params;
     const result = await db.query(
-      'SELECT * FROM maestro_productos WHERE CAST(codigo_producto AS TEXT) = $1 LIMIT 1',
+      'SELECT * FROM maestro_productos WHERE TRIM(CAST(codigo_producto AS TEXT)) = TRIM($1) LIMIT 1',
       [String(codigo_producto)]
     );
     if (result.rows.length === 0) {
