@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 5000;
 
 // 🛡️ 2. MIDDLEWARES GLOBALES (¡DEBEN IR ANTES DE LAS RUTAS!)
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 // 🚀 3. IMPORTAR Y REGISTRAR RUTAS (Ahora 'app' ya existe)
 const authRoutes = require('./routes/auth.routes');
@@ -17,17 +17,18 @@ const productosRoutes = require('./routes/productos.routes');
 const pedidosRoutes = require('./routes/pedidos.routes');
 const cipRoutes = require('./routes/cip.routes');
 const scrapRoutes = require('./routes/scrap.routes');
-const iotRoutes = require('./routes/iot.routes'); // 🤖 NUEVO: Cerebro independiente de Telemetría e IoT
+const iotRoutes = require('./routes/iot.routes'); // 🤖 Cerebro independiente de Telemetría e IoT
 const expedicionRoutes = require('./routes/expedicion.routes');
-
+const herramentalesRoutes = require('./routes/herramentales.routes'); // 🛠️ NUEVO: Cerebro de Clisés y Troqueles (Alistamiento)
 
 app.use('/api/auth', authRoutes);
 app.use('/api/cip', cipRoutes);
 app.use('/api/productos', productosRoutes);
+app.use('/api/herramentales', herramentalesRoutes); // 🛠️ Montado en /api/herramentales
 app.use('/api/pedidos', pedidosRoutes);
 app.use('/api', pedidosRoutes); 
 app.use('/api/scrap', scrapRoutes);
-app.use('/api/iot', iotRoutes);     // 🤖 NUEVO: Montado en su propio espacio seguro (/api/iot/...)
+app.use('/api/iot', iotRoutes);
 app.use('/api/expedicion', expedicionRoutes);
 
 // Ruta de salud

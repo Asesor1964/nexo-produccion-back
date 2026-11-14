@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const { registrarUsoPorOrden } = require('./herramentales.routes');
 
 if (!global.estadoVivoMaquinas) {
   global.estadoVivoMaquinas = {};
@@ -795,6 +796,8 @@ router.put('/:id/produccion', async (req, res) => {
         estado: 'ESPERA', orden: '', operador: operador || '', cajas: 0, velocidad: 0, actualizado: new Date()
       };
     }
+
+    await registrarUsoPorOrden(numOrden, cantFab, paradas);
 
     res.json({ 
       status: 'ok', 

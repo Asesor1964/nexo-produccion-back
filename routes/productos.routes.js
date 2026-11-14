@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const { poblarInventarioDesdeMaestro } = require('./herramentales.routes');
 
-// 🛡️ Auto-migración para asegurar que maestro_productos tenga las columnas de colores
-const asegurarColumnasColores = async () => {
+// 🛡️ Auto-migración para asegurar que maestro_productos tenga las columnas de colores y herramentales
+const asegurarColumnasMaestro = async () => {
   const columnas = [
     'colores TEXT',
     'color_1 VARCHAR(100)',
@@ -11,7 +12,13 @@ const asegurarColumnasColores = async () => {
     'color_3 VARCHAR(100)',
     'color_4 VARCHAR(100)',
     'color_5 VARCHAR(100)',
-    'color_6 VARCHAR(100)'
+    'color_6 VARCHAR(100)',
+    'plano VARCHAR(100)',
+    'troquel VARCHAR(150)',
+    'ubic_troquel VARCHAR(150)',
+    'clise VARCHAR(150)',
+    'ubic_clise VARCHAR(150)',
+    'bocas INTEGER DEFAULT 1'
   ];
   for (const col of columnas) {
     try {
@@ -21,9 +28,9 @@ const asegurarColumnasColores = async () => {
     }
   }
 };
-asegurarColumnasColores();
+asegurarColumnasMaestro();
 
-// POST: Sincronizar / Importar lotes de Maestro de Productos (Incluyendo Colores)
+// POST: Sincronizar / Importar lotes de Maestro de Productos (Incluyendo Colores, Clisés y Troqueles)
 router.post('/sincronizar', async (req, res) => {
   const { productos } = req.body;
 
@@ -32,7 +39,7 @@ router.post('/sincronizar', async (req, res) => {
   }
 
   try {
-    await asegurarColumnasColores();
+    await asegurarColumnasMaestro();
 
     let insertados = 0;
     let omitidos = 0;
@@ -40,7 +47,8 @@ router.post('/sincronizar', async (req, res) => {
     for (const prod of productos) {
       const {
         codigo_producto, cliente, descripcion, material,
-        largo_mm, ancho_mm, superficie_m2, herramientas, ruta_sugerida
+        largo_mm, ancho_mm, superficie_m2, herramientas, ruta_sugerida,
+        plano, troquel, ubic_troquel, clise, ubic_clise, bocas
       } = prod;
 
       const textoColores = prod.colores || prod.tintas || prod.receta_colores || '';
@@ -61,9 +69,10 @@ router.post('/sincronizar', async (req, res) => {
         INSERT INTO maestro_productos (
           codigo_producto, cliente, descripcion, material,
           largo_mm, ancho_mm, superficie_m2, herramientas, ruta_sugerida,
-          colores, color_1, color_2, color_3, color_4, color_5, color_6
+          colores, color_1, color_2, color_3, color_4, color_5, color_6,
+          plano, troquel, ubic_troquel, clise, ubic_clise, bocas
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         ON CONFLICT (codigo_producto) DO UPDATE SET
           cliente = EXCLUDED.cliente,
           descripcion = EXCLUDED.descripcion,
@@ -80,6 +89,12 @@ router.post('/sincronizar', async (req, res) => {
           color_4 = COALESCE(EXCLUDED.color_4, maestro_productos.color_4),
           color_5 = COALESCE(EXCLUDED.color_5, maestro_productos.color_5),
           color_6 = COALESCE(EXCLUDED.color_6, maestro_productos.color_6),
+          plano = COALESCE(EXCLUDED.plano, maestro_productos.plano),
+          troquel = COALESCE(EXCLUDED.troquel, maestro_productos.troquel),
+          ubic_troquel = COALESCE(EXCLUDED.ubic_troquel, maestro_productos.ubic_troquel),
+          clise = COALESCE(EXCLUDED.clise, maestro_productos.clise),
+          ubic_clise = COALESCE(EXCLUDED.ubic_clise, maestro_productos.ubic_clise),
+          bocas = COALESCE(EXCLUDED.bocas, maestro_productos.bocas),
           fecha_actualizacion = CURRENT_TIMESTAMP;
       `;
 
@@ -87,7 +102,9 @@ router.post('/sincronizar', async (req, res) => {
         codigo_producto, cliente, descripcion, material || null,
         largo_mm || null, ancho_mm || null, superficie_m2 || null,
         herramientas || null, ruta_sugerida ? ruta_sugerida.trim() : null,
-        resumenColores, c1, c2, c3, c4, c5, c6
+        resumenColores, c1, c2, c3, c4, c5, c6,
+        plano || null, troquel || null, ubic_troquel || null,
+        clise || null, ubic_clise || null, parseInt(bocas, 10) || 1
       ];
 
       try {
@@ -114,9 +131,18 @@ router.post('/sincronizar', async (req, res) => {
 
     const nuevasRutas = rutasRes.rowCount || 0;
 
+    // 🛠️ Poblar automáticamente el inventario de Clisés y Troqueles
+    let resumenHerramentales = '';
+    try {
+      const { troquelesSinc, clisesSinc } = await poblarInventarioDesdeMaestro();
+      resumenHerramentales = `\n🔪 Troqueles sincronizados: ${troquelesSinc}\n🎨 Clisés sincronizados: ${clisesSinc}`;
+    } catch (e) {
+      console.error('Aviso sincronizando herramentales:', e.message);
+    }
+
     res.json({ 
       status: 'ok', 
-      mensaje: `Sincronización completada.\n✅ Productos procesados: ${insertados}\n🛣️ Nuevas rutas detectadas y agregadas: ${nuevasRutas}\n⚠️ Omitidos: ${omitidos}` 
+      mensaje: `Sincronización completada.\n✅ Productos procesados: ${insertados}\n🛣️ Nuevas rutas detectadas y agregadas: ${nuevasRutas}${resumenHerramentales}\n⚠️ Omitidos: ${omitidos}` 
     });
   } catch (error) {
     console.error('Error al sincronizar productos:', error);
