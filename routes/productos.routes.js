@@ -30,14 +30,16 @@ const asegurarColumnasMaestro = async () => {
 asegurarColumnasMaestro();
 
 router.post('/sincronizar', async (req, res) => {
-  const { productos } = req.body;
+  const { productos, omitir_herramentales } = req.body;
 
   if (!Array.isArray(productos) || productos.length === 0) {
     return res.status(400).json({ error: 'No se recibieron productos para procesar' });
   }
 
+  const client = await db.connect();
+
   try {
-    await asegurarColumnasMaestro();
+    await client.query('BEGIN');
 
     let insertados = 0;
     let omitidos = 0;
@@ -66,7 +68,6 @@ router.post('/sincronizar', async (req, res) => {
       const resumenColores = textoColores || [c1, c2, c3, c4, c5, c6].filter(Boolean).join(', ') || null;
       const bocasNum = bocas !== undefined && bocas !== null && bocas !== '' ? parseInt(bocas, 10) : null;
 
-      // 🛡️ BLINDAJE TOTAL: COALESCE evita que una actualización parcial borre datos ya existentes
       const query = `
         INSERT INTO maestro_productos (
           codigo_producto, cliente, descripcion, material,
@@ -120,45 +121,60 @@ router.post('/sincronizar', async (req, res) => {
       ];
 
       try {
-        await db.query(query, values);
+        await client.query('SAVEPOINT sp_prod');
+        await client.query(query, values);
+        await client.query('RELEASE SAVEPOINT sp_prod');
         insertados++;
       } catch (rowError) {
+        await client.query('ROLLBACK TO SAVEPOINT sp_prod');
         console.error(`Error en producto ${codigo_producto}:`, rowError.message);
         omitidos++;
       }
     }
 
-    const rutasRes = await db.query(`
-      INSERT INTO rutas_produccion (codigo_ruta, descripcion, activo)
-      SELECT DISTINCT 
-        TRIM(UPPER(ruta_sugerida)) AS codigo_ruta, 
-        TRIM(ruta_sugerida) AS descripcion, 
-        TRUE AS activo
-      FROM maestro_productos
-      WHERE ruta_sugerida IS NOT NULL 
-        AND TRIM(ruta_sugerida) <> ''
-      ON CONFLICT (codigo_ruta) DO NOTHING
-      RETURNING *;
-    `);
+    await client.query('COMMIT');
 
-    const nuevasRutas = rutasRes.rowCount || 0;
-
-    // Sincronizamos el inventario de Clisés y Troqueles
+    let nuevasRutas = 0;
     let resumenHerramentales = '';
-    try {
-      const { troquelesSinc, clisesSinc } = await poblarInventarioDesdeMaestro();
-      resumenHerramentales = `\n🔪 Troqueles actualizados: ${troquelesSinc}\n🎨 Clisés actualizados: ${clisesSinc}`;
-    } catch (e) {
-      console.error('Aviso sincronizando herramentales:', e.message);
+
+    // Solo sincronizamos rutas y herramentales al finalizar el último lote
+    if (!omitir_herramentales) {
+      const rutasRes = await db.query(`
+        INSERT INTO rutas_produccion (codigo_ruta, descripcion, activo)
+        SELECT DISTINCT 
+          TRIM(UPPER(ruta_sugerida)) AS codigo_ruta, 
+          TRIM(ruta_sugerida) AS descripcion, 
+          TRUE AS activo
+        FROM maestro_productos
+        WHERE ruta_sugerida IS NOT NULL 
+          AND TRIM(ruta_sugerida) <> ''
+        ON CONFLICT (codigo_ruta) DO NOTHING
+        RETURNING *;
+      `);
+      nuevasRutas = rutasRes.rowCount || 0;
+
+      try {
+        const { troquelesSinc, clisesSinc } = await poblarInventarioDesdeMaestro();
+        resumenHerramentales = `\n🔪 Troqueles actualizados: ${troquelesSinc}\n🎨 Clisés actualizados: ${clisesSinc}`;
+      } catch (e) {
+        console.error('Aviso sincronizando herramentales:', e.message);
+      }
     }
 
     res.json({ 
-      status: 'ok', 
+      status: 'ok',
+      insertados,
+      omitidos,
+      nuevasRutas,
+      resumenHerramentales,
       mensaje: `Sincronización completada.\n✅ Productos procesados: ${insertados}\n🛣️ Nuevas rutas detectadas: ${nuevasRutas}${resumenHerramentales}\n⚠️ Omitidos: ${omitidos}` 
     });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Error al sincronizar productos:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
+  } finally {
+    client.release();
   }
 });
 
