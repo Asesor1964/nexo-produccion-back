@@ -29,29 +29,58 @@ const asegurarColumnasMaestro = async () => {
 };
 asegurarColumnasMaestro();
 
+// Helpers para evitar que "NaN" o textos sucios rompan PostgreSQL
+const limpiarEntero = (val, def = null) => {
+  if (val === undefined || val === null || val === '') return def;
+  const num = parseInt(String(val).replace(/[^\d-]/g, ''), 10);
+  return Number.isNaN(num) ? def : num;
+};
+
+const limpiarDecimal = (val, def = null) => {
+  if (val === undefined || val === null || val === '') return def;
+  const normalizado = String(val).replace(',', '.').replace(/[^\d.-]/g, '');
+  const num = parseFloat(normalizado);
+  return Number.isNaN(num) ? def : num;
+};
+
 router.post('/sincronizar', async (req, res) => {
-  const { productos, omitir_herramentales } = req.body;
-
-  if (!Array.isArray(productos) || productos.length === 0) {
-    return res.status(400).json({ error: 'No se recibieron productos para procesar' });
-  }
-
-  const client = await db.connect();
+  let client = null;
+  let liberarCliente = false;
 
   try {
-    await client.query('BEGIN');
+    const { productos, omitir_herramentales } = req.body || {};
+
+    if (!Array.isArray(productos) || productos.length === 0) {
+      return res.status(400).json({ error: 'No se recibieron productos para procesar' });
+    }
+
+    // 1. Obtener cliente de forma segura (soporta pool.connect() o db.pool.connect() o fallback a db)
+    if (typeof db.connect === 'function') {
+      client = await db.connect();
+      liberarCliente = true;
+    } else if (db.pool && typeof db.pool.connect === 'function') {
+      client = await db.pool.connect();
+      liberarCliente = true;
+    } else {
+      client = db; // Fallback si db.js solo exporta { query }
+    }
 
     let insertados = 0;
     let omitidos = 0;
 
+    // Si tenemos cliente dedicado, usamos transacción con SAVEPOINT
+    if (liberarCliente) {
+      await client.query('BEGIN');
+    }
+
     for (const prod of productos) {
+      if (!prod || !prod.codigo_producto) continue;
+
       const {
         codigo_producto, cliente, descripcion, material,
         largo_mm, ancho_mm, superficie_m2, herramientas, ruta_sugerida,
         plano, troquel, ubic_troquel, clise, ubic_clise, bocas
       } = prod;
-
-      if (!codigo_producto) continue;
 
       const textoColores = prod.colores || prod.tintas || prod.receta_colores || '';
       const listaColores = textoColores
@@ -65,8 +94,8 @@ router.post('/sincronizar', async (req, res) => {
       const c5 = prod.color_5 || prod.color5 || prod.tinta_5 || prod.tinta5 || listaColores[4] || null;
       const c6 = prod.color_6 || prod.color6 || prod.tinta_6 || prod.tinta6 || listaColores[5] || null;
 
-      const resumenColores = textoColores || [c1, c2, c3, c4, c5, c6].filter(Boolean).join(', ') || null;
-      const bocasNum = bocas !== undefined && bocas !== null && bocas !== '' ? parseInt(bocas, 10) : null;
+      const resumenColores = textoColores ? String(textoColores) : ([c1, c2, c3, c4, c5, c6].filter(Boolean).join(', ') || null);
+      const bocasNum = limpiarEntero(bocas, null);
 
       const query = `
         INSERT INTO maestro_productos (
@@ -103,65 +132,82 @@ router.post('/sincronizar', async (req, res) => {
 
       const values = [
         String(codigo_producto).trim(),
-        cliente || null,
-        descripcion || null,
-        material || null,
-        largo_mm || null,
-        ancho_mm || null,
-        superficie_m2 || null,
-        herramientas || null,
-        ruta_sugerida ? ruta_sugerida.trim() : null,
-        resumenColores, c1, c2, c3, c4, c5, c6,
-        plano || null,
-        troquel || null,
-        ubic_troquel || null,
-        clise || null,
-        ubic_clise || null,
+        cliente ? String(cliente).trim() : null,
+        descripcion ? String(descripcion).trim() : null,
+        material ? String(material).trim() : null,
+        limpiarDecimal(largo_mm),
+        limpiarDecimal(ancho_mm),
+        limpiarDecimal(superficie_m2),
+        herramientas ? String(herramientas).trim() : null,
+        ruta_sugerida ? String(ruta_sugerida).trim() : null,
+        resumenColores,
+        c1 ? String(c1).trim() : null,
+        c2 ? String(c2).trim() : null,
+        c3 ? String(c3).trim() : null,
+        c4 ? String(c4).trim() : null,
+        c5 ? String(c5).trim() : null,
+        c6 ? String(c6).trim() : null,
+        plano ? String(plano).trim() : null,
+        troquel ? String(troquel).trim() : null,
+        ubic_troquel ? String(ubic_troquel).trim() : null,
+        clise ? String(clise).trim() : null,
+        ubic_clise ? String(ubic_clise).trim() : null,
         bocasNum
       ];
 
       try {
-        await client.query('SAVEPOINT sp_prod');
+        if (liberarCliente) await client.query('SAVEPOINT sp_prod');
         await client.query(query, values);
-        await client.query('RELEASE SAVEPOINT sp_prod');
+        if (liberarCliente) await client.query('RELEASE SAVEPOINT sp_prod');
         insertados++;
       } catch (rowError) {
-        await client.query('ROLLBACK TO SAVEPOINT sp_prod');
+        if (liberarCliente) await client.query('ROLLBACK TO SAVEPOINT sp_prod');
         console.error(`Error en producto ${codigo_producto}:`, rowError.message);
         omitidos++;
       }
     }
 
-    await client.query('COMMIT');
+    if (liberarCliente) {
+      await client.query('COMMIT');
+      // Liberamos el cliente ANTES de llamar a poblarInventarioDesdeMaestro para no agotar el pool
+      client.release();
+      liberarCliente = false;
+    }
 
     let nuevasRutas = 0;
     let resumenHerramentales = '';
 
     // Solo sincronizamos rutas y herramentales al finalizar el último lote
     if (!omitir_herramentales) {
-      const rutasRes = await db.query(`
-        INSERT INTO rutas_produccion (codigo_ruta, descripcion, activo)
-        SELECT DISTINCT 
-          TRIM(UPPER(ruta_sugerida)) AS codigo_ruta, 
-          TRIM(ruta_sugerida) AS descripcion, 
-          TRUE AS activo
-        FROM maestro_productos
-        WHERE ruta_sugerida IS NOT NULL 
-          AND TRIM(ruta_sugerida) <> ''
-        ON CONFLICT (codigo_ruta) DO NOTHING
-        RETURNING *;
-      `);
-      nuevasRutas = rutasRes.rowCount || 0;
+      try {
+        const rutasRes = await db.query(`
+          INSERT INTO rutas_produccion (codigo_ruta, descripcion, activo)
+          SELECT DISTINCT 
+            TRIM(UPPER(ruta_sugerida)) AS codigo_ruta, 
+            TRIM(ruta_sugerida) AS descripcion, 
+            TRUE AS activo
+          FROM maestro_productos
+          WHERE ruta_sugerida IS NOT NULL 
+            AND TRIM(ruta_sugerida) <> ''
+          ON CONFLICT (codigo_ruta) DO NOTHING
+          RETURNING *;
+        `);
+        nuevasRutas = rutasRes.rowCount || 0;
+      } catch (errRutas) {
+        console.error('Aviso sincronizando rutas:', errRutas.message);
+      }
 
       try {
-        const { troquelesSinc, clisesSinc } = await poblarInventarioDesdeMaestro();
-        resumenHerramentales = `\n🔪 Troqueles actualizados: ${troquelesSinc}\n🎨 Clisés actualizados: ${clisesSinc}`;
+        if (typeof poblarInventarioDesdeMaestro === 'function') {
+          const { troquelesSinc, clisesSinc } = await poblarInventarioDesdeMaestro();
+          resumenHerramentales = `\n🔪 Troqueles actualizados: ${troquelesSinc}\n🎨 Clisés actualizados: ${clisesSinc}`;
+        }
       } catch (e) {
         console.error('Aviso sincronizando herramentales:', e.message);
       }
     }
 
-    res.json({ 
+    return res.json({ 
       status: 'ok',
       insertados,
       omitidos,
@@ -169,12 +215,20 @@ router.post('/sincronizar', async (req, res) => {
       resumenHerramentales,
       mensaje: `Sincronización completada.\n✅ Productos procesados: ${insertados}\n🛣️ Nuevas rutas detectadas: ${nuevasRutas}${resumenHerramentales}\n⚠️ Omitidos: ${omitidos}` 
     });
+
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('Error al sincronizar productos:', error);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    if (liberarCliente && client) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+    console.error('🔥 Error crítico al sincronizar productos:', error);
+    return res.status(500).json({ 
+      error: error.message || 'Error interno del servidor',
+      detalle: error.detail || null
+    });
   } finally {
-    client.release();
+    if (liberarCliente && client) {
+      try { client.release(); } catch (e) {}
+    }
   }
 });
 

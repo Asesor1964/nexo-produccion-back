@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 5000;
 // 🛡️ 2. MIDDLEWARES GLOBALES (¡DEBEN IR ANTES DE LAS RUTAS!)
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
 
 // 🚀 3. IMPORTAR Y REGISTRAR RUTAS (Ahora 'app' ya existe)
 const authRoutes = require('./routes/auth.routes');
@@ -45,6 +46,16 @@ app.get('/api/health', async (req, res) => {
 app.use((req, res, next) => {
   console.log(`❌ Ruta no encontrada (404): ${req.method} ${req.originalUrl}`);
   res.status(404).json({ error: `Ruta ${req.originalUrl} no encontrada en el backend` });
+});
+
+// 🚨 RADAR GLOBAL DE ERRORES 500 (Evita respuestas HTML <!DOCTYPE... en fallos no controlados)
+app.use((err, req, res, next) => {
+  console.error(`🔥 Error 500 en ${req.method} ${req.originalUrl}:`, err);
+  res.status(err.status || 500).json({
+    ok: false,
+    error: err.message || 'Error interno del servidor',
+    detalle: err.detail || err.hint || null
+  });
 });
 
 app.listen(PORT, () => {
