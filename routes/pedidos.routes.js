@@ -7,6 +7,29 @@ if (!global.estadoVivoMaquinas) {
   global.estadoVivoMaquinas = {};
 }
 
+// Aseguramos la tabla que desglosa cada parte diario/parcial para Estadísticas y OEE por fecha
+const asegurarTablaPartesHistorial = async () => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.partes_produccion_historial (
+        id SERIAL PRIMARY KEY,
+        numero_orden INTEGER NOT NULL,
+        fecha_produccion DATE NOT NULL,
+        turno VARCHAR(10) DEFAULT 'M',
+        maquina VARCHAR(50),
+        operador VARCHAR(100),
+        supervisor VARCHAR(100),
+        cantidad_parte NUMERIC DEFAULT 0,
+        minutos_setup NUMERIC DEFAULT 0,
+        fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+  } catch (err) {
+    console.error('Aviso verificando tabla partes_produccion_historial:', err.message);
+  }
+};
+asegurarTablaPartesHistorial();
+
 const extraerNucleoMaquina = (cod) => {
   if (!cod) return '';
   const texto = cod.toUpperCase().trim();
@@ -315,7 +338,7 @@ router.get('/recursos/paradas', async (req, res) => {
 });
 
 // =========================================================================
-// 4. TIEMPOS MUERTOS E HISTORIAL
+// 4. TIEMPOS MUERTOS E HISTORIAL (DESGLOSADO POR PARTES / FECHAS PARA OEE)
 // =========================================================================
 
 router.get(['/tiempos-muertos/todos', '/tiempos-muertos'], async (req, res) => {
@@ -385,10 +408,39 @@ router.delete('/tiempos-muertos/:id', async (req, res) => {
   }
 });
 
+// 📊 HISTORIAL INTELIGENTE: Si una orden se fabricó en 2 o más partes (ej. Sábado + Lunes),
+// devuelve cada parcial en su fecha correspondiente para que las estadísticas diarias den exactas.
 router.get('/historial', async (req, res) => {
   try {
     const query = `
-      SELECT o.numero_orden AS id, o.*,
+      SELECT 
+        o.numero_orden AS id,
+        o.numero_orden,
+        o.codigo_producto,
+        o.cantidad_programada,
+        COALESCE(ph.cantidad_parte, o.cantidad_fabricada, 0) AS cantidad_fabricada,
+        COALESCE(o.cantidad_fabricada, 0) AS cantidad_fabricada_total_orden,
+        o.cantidad_faltante,
+        o.fecha_entrega,
+        o.fecha_pedido,
+        COALESCE(ph.fecha_produccion, o.fecha_produccion) AS fecha_produccion,
+        COALESCE(ph.turno, o.turno) AS turno,
+        COALESCE(ph.operador, o.operador) AS operador,
+        COALESCE(ph.maquina, o.maquina_asignada) AS maquina_asignada,
+        o.rubro,
+        o.largo,
+        o.ancho,
+        o.plancha,
+        CASE 
+          WHEN ph.cantidad_parte IS NOT NULL AND COALESCE(o.cantidad_programada, 0) > 0 AND COALESCE(o.m2_tot, 0) > 0
+          THEN ROUND((o.m2_tot * (ph.cantidad_parte / o.cantidad_programada))::numeric, 2)
+          ELSE o.m2_tot
+        END AS m2_tot,
+        o.m2_pend,
+        o.peso,
+        o.estado,
+        o.prioridad_secuencia,
+        ph.id AS parte_id,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
         COALESCE(p.colores, '') AS colores,
@@ -400,12 +452,14 @@ router.get('/historial', async (req, res) => {
         COALESCE(p.color_6, '') AS color_6
       FROM ordenes_produccion o
       LEFT JOIN maestro_productos p ON TRIM(o.codigo_producto) = TRIM(p.codigo_producto)
-      WHERE TRIM(LOWER(o.estado)) IN ('finalizada', 'completada', 'terminada', 'cerrada', 'finalizada parcial', 'parcial')
-      ORDER BY o.numero_orden DESC;
+      LEFT JOIN partes_produccion_historial ph ON ph.numero_orden = o.numero_orden
+      WHERE TRIM(LOWER(o.estado)) IN ('finalizada', 'completada', 'terminada', 'cerrada', 'finalizada parcial', 'parcial', 'cerrado por acuerdo')
+      ORDER BY COALESCE(ph.fecha_produccion, o.fecha_produccion) DESC NULLS LAST, o.numero_orden DESC, ph.id DESC;
     `;
     const { rows } = await db.query(query);
     res.json(rows);
-  } catch (error) { 
+  } catch (error) {
+    console.error('Error en GET /historial:', error.message);
     res.json([]); 
   }
 });
@@ -493,7 +547,8 @@ router.get('/', async (req, res) => {
       SELECT 
         o.numero_orden AS id, o.numero_orden, o.codigo_producto, 
         o.cantidad_programada, COALESCE(o.cantidad_fabricada, 0) AS cantidad_fabricada, COALESCE(o.cantidad_faltante, 0) AS cantidad_faltante,
-        o.fecha_entrega, o.fecha_pedido, o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia,
+        o.fecha_entrega, o.fecha_pedido, o.fecha_produccion, o.turno, o.operador,
+        o.rubro, o.largo, o.ancho, o.plancha, o.m2_tot, o.m2_pend, o.peso, o.estado, o.prioridad_secuencia,
         COALESCE(NULLIF(o.cliente, ''), p.cliente, 'Sin cliente') AS cliente,
         COALESCE(NULLIF(o.descripcion_producto, ''), p.descripcion, 'Sin descripción') AS producto_descripcion,
         COALESCE(NULLIF(TRIM(o.maquina_asignada), ''), TRIM(UPPER(p.ruta_sugerida)), 'COR-JS') AS maquina_asignada,
@@ -691,6 +746,10 @@ router.put('/:id/revivir', async (req, res) => {
     const numOrden = parseInt(id, 10);
     const reset = resetear_cantidades !== false;
 
+    if (reset) {
+      await db.query('DELETE FROM partes_produccion_historial WHERE numero_orden = $1', [numOrden]).catch(() => {});
+    }
+
     const query = reset
       ? `UPDATE ordenes_produccion 
          SET estado = 'Pendiente', 
@@ -708,7 +767,6 @@ router.put('/:id/revivir', async (req, res) => {
     try {
       result = await db.query(query, [numOrden]);
     } catch (colErr) {
-      // Fallback seguro si estado_logistico no existe en la tabla
       result = await db.query(
         `UPDATE ordenes_produccion 
          SET estado = 'Pendiente', cantidad_fabricada = 0, cantidad_faltante = 0
@@ -823,7 +881,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // =========================================================================
-// 8. CARGA MANUAL HISTÓRICA DE PARTES FÍSICOS (JEFE DE PRODUCCIÓN)
+// 8. CARGA MANUAL HISTÓRICA DE PARTES FÍSICOS (SOPORTA SUMA DE PARCIALES)
 // =========================================================================
 router.post('/:id/carga-manual-historica', async (req, res) => {
   const { id } = req.params;
@@ -834,6 +892,9 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
     operador,
     supervisor,
     cantidad_fabricada,
+    cantidad_parte_actual,
+    modo_acumulacion, // 'SUMAR' | 'REEMPLAZAR'
+    sumar_a_existente,
     estado_cierre, // 'Finalizada', 'Finalizada Parcial', 'Cerrado por Acuerdo'
     minutos_setup,
     paradas, // [{ codigo, motivo, minutos }]
@@ -843,10 +904,12 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
 
   try {
     const numOrden = parseInt(id, 10);
-    const cantFab = parseFloat(cantidad_fabricada) || 0;
     const maqFinal = String(maquina || 'COR-JS').trim().toUpperCase();
     const opFinal = String(operador || 'Operador Planta').trim();
+    const supFinal = String(supervisor || 'SERGIO SANCHEZ').trim();
     const turnoFinal = String(turno || 'M').trim();
+    const fechaProdFinal = fecha_produccion || new Date().toISOString().split('T')[0];
+    const minSetup = parseFloat(minutos_setup) || 0;
 
     // Aseguramos columnas de auditoría histórica en ordenes_produccion
     await db.query(`
@@ -865,16 +928,72 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
 
     const ordenOriginal = ordenOrigRes.rows[0];
     const metaProgramada = parseFloat(ordenOriginal.cantidad_programada) || 0;
-    const faltanteCalculado = Math.max(0, metaProgramada - cantFab);
+    const cantidadPreviaEnBD = parseFloat(ordenOriginal.cantidad_fabricada) || 0;
+
+    const esSuma = Boolean(sumar_a_existente || modo_acumulacion === 'SUMAR') && cantidadPreviaEnBD > 0;
+    const cajasDeEsteParte = cantidad_parte_actual !== undefined
+      ? (parseFloat(cantidad_parte_actual) || 0)
+      : (parseFloat(cantidad_fabricada) || 0);
+
+    const cantTotalAcumulada = esSuma
+      ? (cantidadPreviaEnBD + cajasDeEsteParte)
+      : (parseFloat(cantidad_fabricada) || cajasDeEsteParte);
+
+    const faltanteCalculado = Math.max(0, metaProgramada - cantTotalAcumulada);
 
     let estadoFinal = estado_cierre;
     if (!estadoFinal) {
-      estadoFinal = (cantFab < metaProgramada && cantFab > 0) ? 'Finalizada Parcial' : 'Finalizada';
+      estadoFinal = (cantTotalAcumulada < metaProgramada && cantTotalAcumulada > 0) ? 'Finalizada Parcial' : 'Finalizada';
     }
 
-    const fechaProdFinal = fecha_produccion || new Date().toISOString().split('T')[0];
+    // 📌 REGISTRO EN HISTORIAL DE PARTES DIARIOS (Para que Sábado y Hoy figuren cada uno en su fecha)
+    const partesExistentesRes = await db.query(
+      'SELECT COUNT(*)::int AS cant FROM partes_produccion_historial WHERE numero_orden = $1',
+      [numOrden]
+    );
+    const cantPartesPrevios = partesExistentesRes.rows[0]?.cant || 0;
 
-    // 1. Actualizar la orden de producción con los datos reales de la planilla física
+    if (esSuma) {
+      // Si el parcial anterior (ej. Sábado) se había cargado antes de existir esta tabla, lo rescatamos automáticamente
+      if (cantPartesPrevios === 0 && cantidadPreviaEnBD > 0) {
+        const fechaPrevia = ordenOriginal.fecha_produccion
+          ? new Date(ordenOriginal.fecha_produccion).toISOString().split('T')[0]
+          : fechaProdFinal;
+        await db.query(
+          `INSERT INTO partes_produccion_historial (
+             numero_orden, fecha_produccion, turno, maquina, operador, supervisor, cantidad_parte, minutos_setup
+           ) VALUES ($1, $2::date, $3, $4, $5, $6, $7::numeric, 0)`,
+          [
+            numOrden,
+            fechaPrevia,
+            ordenOriginal.turno || 'M',
+            ordenOriginal.maquina_asignada || maqFinal,
+            ordenOriginal.operador || opFinal,
+            supFinal,
+            cantidadPreviaEnBD
+          ]
+        );
+      }
+
+      // Insertamos el nuevo parcial de hoy con su fecha, turno y maquinista propios
+      await db.query(
+        `INSERT INTO partes_produccion_historial (
+           numero_orden, fecha_produccion, turno, maquina, operador, supervisor, cantidad_parte, minutos_setup
+         ) VALUES ($1, $2::date, $3, $4, $5, $6, $7::numeric, $8::numeric)`,
+        [numOrden, fechaProdFinal, turnoFinal, maqFinal, opFinal, supFinal, cajasDeEsteParte, minSetup]
+      );
+    } else {
+      // Modo REEMPLAZAR / Carga única: dejamos un único registro limpio con el total corregido
+      await db.query('DELETE FROM partes_produccion_historial WHERE numero_orden = $1', [numOrden]);
+      await db.query(
+        `INSERT INTO partes_produccion_historial (
+           numero_orden, fecha_produccion, turno, maquina, operador, supervisor, cantidad_parte, minutos_setup
+         ) VALUES ($1, $2::date, $3, $4, $5, $6, $7::numeric, $8::numeric)`,
+        [numOrden, fechaProdFinal, turnoFinal, maqFinal, opFinal, supFinal, cantTotalAcumulada, minSetup]
+      );
+    }
+
+    // 1. Actualizar la orden de producción con el TOTAL ACUMULADO
     const updateOrden = await db.query(
       `UPDATE ordenes_produccion
        SET estado = $1,
@@ -892,7 +1011,7 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
         opFinal,
         turnoFinal,
         fechaProdFinal,
-        cantFab,
+        cantTotalAcumulada,
         estadoFinal === 'Finalizada' || estadoFinal === 'Cerrado por Acuerdo' ? 0 : faltanteCalculado,
         numOrden
       ]
@@ -901,15 +1020,13 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
     // 2. Registrar el Set-Up y los Tiempos Muertos con la fecha histórica elegida
     await db.query(`ALTER TABLE tiempos_muertos ADD COLUMN IF NOT EXISTS operador VARCHAR(100)`);
     
-    // Limpiamos paradas previas de esta misma orden si se está re-cargando el parte para no duplicar
-    if (req.body.reemplazar_paradas_previas) {
+    // Solo borramos paradas previas si NO estamos sumando un parcial y el usuario pidió reemplazar
+    if (req.body.reemplazar_paradas_previas && !esSuma) {
       await db.query('DELETE FROM tiempos_muertos WHERE numero_orden = $1', [numOrden]);
     }
 
     const fechaHoraRegistro = `${fechaProdFinal} 12:00:00`;
 
-    // Si informó minutos de Set-Up en la planilla, lo insertamos como registro SET-UP
-    const minSetup = parseFloat(minutos_setup) || 0;
     if (minSetup > 0) {
       await db.query(
         `INSERT INTO tiempos_muertos (maquina, codigo_parada, motivo, minutos_duracion, numero_orden, operador, fecha_registro)
@@ -918,7 +1035,6 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
       );
     }
 
-    // Insertar cada parada anotada en la planilla física
     if (Array.isArray(paradas) && paradas.length > 0) {
       for (const p of paradas) {
         const minParada = parseFloat(p.minutos) || 0;
@@ -934,7 +1050,17 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
       }
     }
 
-    // 3. Si tildó "Adjuntar Planilla CIP RE-PRO 009", guardamos también el protocolo CIP
+    // 3. Descontar giros de Clisé y golpes de Troquel SOLO por las cajas nuevas de este parte
+    try {
+      const cajasParaHerramental = esSuma ? cajasDeEsteParte : cantTotalAcumulada;
+      if (cajasParaHerramental > 0) {
+        await registrarUsoPorOrden(numOrden, cajasParaHerramental, paradas || []);
+      }
+    } catch (errHerr) {
+      console.error('Aviso actualizando uso de herramentales desde carga manual:', errHerr.message);
+    }
+
+    // 4. Si tildó "Adjuntar Planilla CIP RE-PRO 009", guardamos también el protocolo CIP
     if (incluir_cip && datos_cip) {
       const dc = datos_cip;
       const td = {
@@ -963,7 +1089,7 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
           $23
         )`,
         [
-          numOrden, opFinal, supervisor || dc.supervisor || 'SERGIO SANCHEZ', turnoFinal, maqFinal,
+          numOrden, opFinal, supFinal, turnoFinal, maqFinal,
           dc.tipoOnda || 'CB', dc.linerExterno || 'Kraft', dc.tipoCierre || 'Pegado',
           JSON.stringify(td), JSON.stringify(dc.verificacion || {}),
           dc.tinta1Color || '', dc.tinta1Lote || '',
@@ -977,10 +1103,14 @@ router.post('/:id/carga-manual-historica', async (req, res) => {
       );
     }
 
-    console.log(`📋 [PARTE MANUAL] Orden #${numOrden} registrada con fecha ${fechaProdFinal} (${cantFab} cajas).`);
+    console.log(
+      `📋 [PARTE MANUAL] Orden #${numOrden} (${esSuma ? 'SUMA PARCIAL' : 'REGISTRO TOTAL'}) fecha ${fechaProdFinal}: +${cajasDeEsteParte} caj. (Total acum: ${cantTotalAcumulada})`
+    );
     res.json({
       status: 'ok',
-      mensaje: `Parte físico de la Orden #${numOrden} guardado con éxito.`,
+      mensaje: esSuma
+        ? `Parcial de ${cajasDeEsteParte} cajas sumado con éxito (Total acumulado en Orden #${numOrden}: ${cantTotalAcumulada} cajas).`
+        : `Parte físico de la Orden #${numOrden} guardado con éxito (${cantTotalAcumulada} cajas).`,
       orden: updateOrden.rows[0]
     });
   } catch (error) {
