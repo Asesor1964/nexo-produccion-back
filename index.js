@@ -26,6 +26,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/cip', cipRoutes);
 app.use('/api/productos', productosRoutes);
 app.use('/api/herramentales', herramentalesRoutes); // 🛠️ Montado en /api/herramentales
+app.use('/api/corrugadora', require('./routes/corrugadora.routes'));
 app.use('/api/pedidos', pedidosRoutes);
 app.use('/api', pedidosRoutes); 
 app.use('/api/scrap', scrapRoutes);
