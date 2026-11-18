@@ -235,22 +235,20 @@ router.put('/claves/:clave', async (req, res) => {
 });
 
 // =========================================================================
-// 4. 🧠 MOTOR DE IA: OPTIMIZADOR DE COMBINACIÓN Y TRIM IDEAL
+// 4. 🧠 MOTOR DE IA: OPTIMIZADOR DE COMBINACIÓN Y TRIM CON RESTRICCIONES DE MÁQUINA
 // =========================================================================
 router.post('/optimizar', async (req, res) => {
   const {
     clave_objetivo,
-    claves_compatibles = [], // Por si el programador permite mezclar 2 claves con papeles equivalentes
-    anchos_disponibles = [], // Ej. [1400, 1650, 1800, 1900, 2050, 2150]
+    claves_compatibles = [],
+    anchos_disponibles = [],
     trim_minimo_mm = 15,     // Refile mínimo técnico de cuchillas (15mm)
     trim_maximo_pct = 5.5,   // Máximo % de desperdicio tolerable
-    max_pistas_slitter = 6,  // Máximo de cortes longitudinales simultáneos en slitter/scorer
     forzar_ancho_bobina = null,
     forzar_orden_id = null
   } = req.body;
 
   try {
-    // 1. Traer pedidos pendientes válidos con medidas cargadas
     const resPed = await db.query(`
       SELECT 
         o.numero_orden AS id,
@@ -291,8 +289,7 @@ router.post('/optimizar', async (req, res) => {
           ancho_mm: ancho,
           largo_mm: largo,
           bocas,
-          planchas_necesarias: planchas,
-          metros_requeridos_1_salida: Math.round((planchas * largo) / 1000)
+          planchas_necesarias: planchas
         };
       })
       .filter(p => p.ancho_mm > 100 && p.largo_mm > 100 && p.planchas_necesarias > 0)
@@ -305,7 +302,6 @@ router.post('/optimizar', async (req, res) => {
       });
     }
 
-    // Anchos de bobina a evaluar
     let bobinas = Array.isArray(anchos_disponibles) && anchos_disponibles.length > 0
       ? anchos_disponibles.map(Number).filter(n => n > 0)
       : ANCHOS_BASE_DEFAULT;
@@ -314,13 +310,17 @@ router.post('/optimizar', async (req, res) => {
       bobinas = [Number(forzar_ancho_bobina)];
     }
 
-    // Tomamos los primeros 28 pedidos más urgentes para evaluación combinatoria ultrarrápida
     const pool = candidatos.slice(0, 28);
     const propuestasCrudas = [];
 
     const evaluarCombinacion = (bobina, pistas) => {
+      // 🛑 RESTRICCIÓN 1: El Slitter físico solo soporta cortar y marcar hasta un MÁXIMO DE 5 CAJAS a lo ancho
       const salidasTotales = pistas.reduce((acc, p) => acc + p.salidas, 0);
-      if (salidasTotales > max_pistas_slitter) return;
+      if (salidasTotales < 1 || salidasTotales > 5) return;
+
+      // 🛑 RESTRICCIÓN 2: La Guillotina maneja UNICAMENTE DOS MEDIDAS DE LARGO como máximo en simultáneo
+      const largosUnicos = new Set(pistas.map(p => p.orden.largo_mm));
+      if (largosUnicos.size > 2) return;
 
       const anchoUsado = pistas.reduce((acc, p) => acc + (p.orden.ancho_mm * p.salidas), 0);
       const trimMm = bobina - anchoUsado;
@@ -329,13 +329,11 @@ router.post('/optimizar', async (req, res) => {
       const trimPct = Number(((trimMm / bobina) * 100).toFixed(2));
       if (trimPct > Number(trim_maximo_pct)) return;
 
-      // Calculamos los metros lineales óptimos de la tirada (basado en la orden que define el largo de corrida)
       const metrosPorPista = pistas.map(p => ({
         ...p,
         metros_ideales: Math.ceil((p.orden.planchas_necesarias / p.salidas) * (p.orden.largo_mm / 1000))
       }));
 
-      // Tomamos el menor metraje entre las pistas para no sobreproducir en exceso, o el metraje de la orden principal
       const metrosCorrida = Math.max(50, Math.min(...metrosPorPista.map(m => m.metros_ideales)));
 
       let desbalanceTotalPct = 0;
@@ -362,7 +360,6 @@ router.post('/optimizar', async (req, res) => {
         };
       });
 
-      // Puntaje IA (0 a 100): Premia trim bajo, aprovechamiento de ancho y equilibrio de metros entre órdenes
       const penalizacionTrim = trimPct * 12;
       const penalizacionDesbalance = (desbalanceTotalPct / pistas.length) * 0.25;
       const bonusUrgencia = pistas.some(p => p.orden.fecha_entrega) ? 5 : 0;
@@ -386,22 +383,18 @@ router.post('/optimizar', async (req, res) => {
       });
     };
 
-    // Búsqueda combinatoria: 1 orden (1 a 4 salidas) y combinaciones de 2 órdenes distintas en paralelo
     for (const bobina of bobinas) {
       for (let i = 0; i < pool.length; i++) {
         const ordA = pool[i];
-        if (forzar_orden_id && Number(ordA.numero_orden) !== Number(forzar_orden_id)) {
-          // Si forzamos una orden específica, igual puede ir como ordB en el bucle interno
-        }
 
-        // Caso 1: Orden única en múltiples salidas (ej. 2 o 3 cajas a lo ancho)
+        // Caso 1: Orden única (hasta 5 salidas a lo ancho, respetando el límite del slitter)
         if (!forzar_orden_id || Number(ordA.numero_orden) === Number(forzar_orden_id)) {
-          for (let sA = 1; sA <= 4; sA++) {
+          for (let sA = 1; sA <= 5; sA++) {
             evaluarCombinacion(bobina, [{ orden: ordA, salidas: sA }]);
           }
         }
 
-        // Caso 2: Combinación de 2 pedidos distintos a lo ancho ( Duplex / Triplex en Slitter )
+        // Caso 2: Combinación de 2 pedidos distintos en paralelo
         for (let j = i + 1; j < pool.length; j++) {
           const ordB = pool[j];
           if (
@@ -412,19 +405,20 @@ router.post('/optimizar', async (req, res) => {
             continue;
           }
 
-          for (let sA = 1; sA <= 3; sA++) {
-            for (let sB = 1; sB <= 3; sB++) {
-              evaluarCombinacion(bobina, [
-                { orden: ordA, salidas: sA },
-                { orden: ordB, salidas: sB }
-              ]);
+          for (let sA = 1; sA <= 4; sA++) {
+            for (let sB = 1; sB <= 4; sB++) {
+              if (sA + sB <= 5) { // Garantiza que no supere el límite físico de 5 del slitter
+                evaluarCombinacion(bobina, [
+                  { orden: ordA, salidas: sA },
+                  { orden: ordB, salidas: sB }
+                ]);
+              }
             }
           }
         }
       }
     }
 
-    // Deduplicamos y ordenamos por mejor Score IA (menor desperdicio + mejor equilibrio)
     const unicasMap = new Map();
     propuestasCrudas.forEach(prop => {
       if (!unicasMap.has(prop.firma)) {
