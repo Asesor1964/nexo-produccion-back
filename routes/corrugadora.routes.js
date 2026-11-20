@@ -140,8 +140,13 @@ const asegurarTablasCorrugadora = async () => {
 
     await db.query(`
       ALTER TABLE public.corrugadora_programas
-        ADD COLUMN IF NOT EXISTS consumo_estimado_kg NUMERIC(10,2) DEFAULT 0;
+        ADD COLUMN IF NOT EXISTS consumo_estimado_kg NUMERIC(10,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS prioridad_secuencia INTEGER DEFAULT 999,
+        ADD COLUMN IF NOT EXISTS metros_reales NUMERIC(10,2) DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS fecha_inicio TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS fecha_fin TIMESTAMP;
     `).catch(() => {});
+
   } catch (err) {
     console.error('Aviso inicializando tablas de Corrugadora:', err.message);
   }
@@ -808,6 +813,136 @@ router.post('/aprobar-tirada', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: 'Error al registrar tirada: ' + error.message });
+  }
+});
+
+// =========================================================================
+// 7. 🏭 COLA EN VIVO PARA CABINA DEL MAQUINISTA + SECUENCIADOR
+// =========================================================================
+
+// Obtener cola activa (En Proceso + Programadas) con receta de portabobinas
+router.get('/cola-maquinista', async (req, res) => {
+  try {
+    const [resCola, resClaves] = await Promise.all([
+      db.query(`
+        SELECT * FROM public.corrugadora_programas
+        WHERE estado IN ('En Proceso', 'Programada')
+        ORDER BY
+          CASE WHEN estado = 'En Proceso' THEN 0 ELSE 1 END,
+          prioridad_secuencia ASC,
+          id ASC
+      `),
+      db.query('SELECT * FROM public.corrugadora_claves_material')
+    ]);
+
+    const clavesMap = new Map();
+    resClaves.rows.forEach(c => clavesMap.set(normalizarClave(c.clave), c));
+
+    const colaEnriquecida = resCola.rows.map((prog, idx) => ({
+      ...prog,
+      orden_cola: idx + 1,
+      receta: clavesMap.get(normalizarClave(prog.clave_material)) || null
+    }));
+
+    res.json({ cola: colaEnriquecida });
+  } catch (error) {
+    res.status(500).json({ error: 'Error cargando cola de corrugadora: ' + error.message });
+  }
+});
+
+// Reordenar secuencia de fabricación (recibe array ordenado de IDs)
+router.put('/programas/reordenar', async (req, res) => {
+  const { ordenIds = [] } = req.body;
+  if (!Array.isArray(ordenIds) || ordenIds.length === 0) {
+    return res.status(400).json({ error: 'Enviá una lista válida de IDs.' });
+  }
+  try {
+    for (let i = 0; i < ordenIds.length; i++) {
+      await db.query(
+        'UPDATE public.corrugadora_programas SET prioridad_secuencia = $1 WHERE id = $2',
+        [i + 1, Number(ordenIds[i])]
+      );
+    }
+    res.json({ status: 'ok', mensaje: 'Orden de fabricación actualizado.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error reordenando cola: ' + error.message });
+  }
+});
+
+// Editar combinación de una tirada ya programada (sin perder su puesto)
+router.put('/programas/:id', async (req, res) => {
+  const {
+    clave_material, papel_utilizado, es_alternativa_manual = false, motivo_alternativa = '',
+    ancho_bobina_mm, ancho_utilizado_mm, trim_mm, trim_porcentaje,
+    metros_lineales, consumo_estimado_kg = 0, pistas = []
+  } = req.body;
+  try {
+    const upd = await db.query(
+      `UPDATE public.corrugadora_programas
+       SET clave_material = $1, papel_utilizado = $2, es_alternativa_manual = $3,
+           motivo_alternativa = $4, ancho_bobina_mm = $5, ancho_utilizado_mm = $6,
+           trim_mm = $7, trim_porcentaje = $8, metros_lineales = $9,
+           consumo_estimado_kg = $10, pistas_detalle = $11::jsonb
+       WHERE id = $12 AND estado = 'Programada'
+       RETURNING *`,
+      [
+        normalizarClave(clave_material), papel_utilizado || 'Papel Estándar',
+        Boolean(es_alternativa_manual), motivo_alternativa || '',
+        Number(ancho_bobina_mm) || 0, Number(ancho_utilizado_mm) || 0,
+        Number(trim_mm) || 0, Number(trim_porcentaje) || 0,
+        Number(metros_lineales) || 0, Number(consumo_estimado_kg) || 0,
+        JSON.stringify(pistas), Number(req.params.id)
+      ]
+    );
+    if (upd.rows.length === 0) {
+      return res.status(404).json({ error: 'No se encontró la tirada en estado Programada.' });
+    }
+    res.json({ status: 'ok', mensaje: `Combinación de ${upd.rows[0].codigo_tirada} actualizada.`, programa: upd.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Error actualizando combinación: ' + error.message });
+  }
+});
+
+// Cambiar estado desde Cabina del Maquinista (Iniciar / Finalizar)
+router.put('/programas/:id/estado', async (req, res) => {
+  const { estado, metros_reales } = req.body;
+  try {
+    if (estado === 'En Proceso') {
+      await db.query(
+        `UPDATE public.corrugadora_programas
+         SET estado = 'En Proceso', fecha_inicio = COALESCE(fecha_inicio, NOW())
+         WHERE id = $1`,
+        [Number(req.params.id)]
+      );
+    } else if (estado === 'Finalizada') {
+      await db.query(
+        `UPDATE public.corrugadora_programas
+         SET estado = 'Finalizada', metros_reales = $1, fecha_fin = NOW()
+         WHERE id = $2`,
+        [Number(metros_reales) || 0, Number(req.params.id)]
+      );
+    } else {
+      await db.query(
+        'UPDATE public.corrugadora_programas SET estado = $1 WHERE id = $2',
+        [estado, Number(req.params.id)]
+      );
+    }
+    res.json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error actualizando estado: ' + error.message });
+  }
+});
+
+// Quitar tirada programada de la cola
+router.delete('/programas/:id', async (req, res) => {
+  try {
+    await db.query(
+      "DELETE FROM public.corrugadora_programas WHERE id = $1 AND estado = 'Programada'",
+      [Number(req.params.id)]
+    );
+    res.json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
