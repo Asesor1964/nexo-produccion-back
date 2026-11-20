@@ -564,7 +564,8 @@ router.post('/optimizar', async (req, res) => {
     trim_minimo_mm = 15,
     trim_maximo_pct = 5.5,
     forzar_ancho_bobina = null,
-    forzar_orden_id = null
+    forzar_orden_id = null,
+    ordenes_seleccionadas = [] // 👈 NUEVO: lista puntual de N° de órdenes a corrugar hoy
   } = req.body;
 
   try {
@@ -626,9 +627,16 @@ router.post('/optimizar', async (req, res) => {
         .map(normalizarClave)
     );
 
+    const seleccionSet = new Set(
+      (Array.isArray(ordenes_seleccionadas) ? ordenes_seleccionadas : []).map(Number)
+    );
+
     const candidatos = candidatosBase
       .filter(p => p.ancho_mm > 100 && p.largo_mm > 100 && p.planchas_necesarias > 0)
-      .filter(p => clavesFiltro.size === 0 || clavesFiltro.has(p.clave_material));
+      .filter(p => clavesFiltro.size === 0 || clavesFiltro.has(p.clave_material))
+      .filter(p => seleccionSet.size === 0 || seleccionSet.has(Number(p.numero_orden))); // 👈 Solo los elegidos
+
+    
 
     if (candidatos.length === 0) {
       return res.json({ propuestas: [], mensaje: 'No hay pedidos pendientes con medidas válidas para esta clave.' });
