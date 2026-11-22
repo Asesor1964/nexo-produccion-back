@@ -174,6 +174,15 @@ const parseFechaISO = (fechaStr) => {
   return null;
 };
 
+// Busca la receta exacta (ej. "TMZ390 RH") y si no existe, busca por código base ("TMZ390")
+const buscarRecetaPorClave = (clavesMap, claveStr) => {
+  const full = normalizarClave(claveStr);
+  if (clavesMap.has(full)) return clavesMap.get(full);
+  const base = full.split(/\s+/)[0]; // "TMZ390 RH" -> "TMZ390"
+  if (clavesMap.has(base)) return clavesMap.get(base);
+  return null;
+};
+
 // Calcula el gramaje efectivo por m² de plancha (incluyendo factor de acanalado ~1.38 en ondas)
 const calcularGramajeEfectivoClave = (claveObj) => {
   if (!claveObj) return 420; // Fallback estándar si no está cargada la receta
@@ -838,11 +847,17 @@ router.get('/cola-maquinista', async (req, res) => {
     const clavesMap = new Map();
     resClaves.rows.forEach(c => clavesMap.set(normalizarClave(c.clave), c));
 
-    const colaEnriquecida = resCola.rows.map((prog, idx) => ({
-      ...prog,
-      orden_cola: idx + 1,
-      receta: clavesMap.get(normalizarClave(prog.clave_material)) || null
-    }));
+    const colaEnriquecida = resCola.rows.map((prog, idx) => {
+      const claveNorm = normalizarClave(prog.clave_material);
+      const recetaBase = buscarRecetaPorClave(clavesMap, claveNorm);
+      return {
+        ...prog,
+        orden_cola: idx + 1,
+        es_rh: /\bRH\b/.test(claveNorm),
+        es_blanco: claveNorm.includes('BLANCO'),
+        receta: recetaBase
+      };
+    });
 
     res.json({ cola: colaEnriquecida });
   } catch (error) {
