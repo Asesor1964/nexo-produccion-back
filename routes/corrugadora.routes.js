@@ -144,7 +144,8 @@ const asegurarTablasCorrugadora = async () => {
         ADD COLUMN IF NOT EXISTS prioridad_secuencia INTEGER DEFAULT 999,
         ADD COLUMN IF NOT EXISTS metros_reales NUMERIC(10,2) DEFAULT 0,
         ADD COLUMN IF NOT EXISTS fecha_inicio TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS fecha_fin TIMESTAMP;
+        ADD COLUMN IF NOT EXISTS fecha_fin TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS portabobinas_asignados JSONB DEFAULT NULL;
     `).catch(() => {});
 
   } catch (err) {
@@ -777,7 +778,8 @@ router.post('/aprobar-tirada', async (req, res) => {
   const {
     clave_material, papel_utilizado, es_alternativa_manual = false, motivo_alternativa = '',
     ancho_bobina_mm, ancho_utilizado_mm, trim_mm, trim_porcentaje,
-    metros_lineales, consumo_estimado_kg = 0, pistas = [], habilitar_en_conversion = true
+    metros_lineales, consumo_estimado_kg = 0, pistas = [],
+    portabobinas_asignados = null, habilitar_en_conversion = true
   } = req.body;
 
   if (!Array.isArray(pistas) || pistas.length === 0) {
@@ -789,8 +791,9 @@ router.post('/aprobar-tirada', async (req, res) => {
     const ins = await db.query(
       `INSERT INTO public.corrugadora_programas (
          codigo_tirada, clave_material, papel_utilizado, es_alternativa_manual, motivo_alternativa,
-         ancho_bobina_mm, ancho_utilizado_mm, trim_mm, trim_porcentaje, metros_lineales, consumo_estimado_kg, pistas_detalle, estado
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,'Programada')
+         ancho_bobina_mm, ancho_utilizado_mm, trim_mm, trim_porcentaje, metros_lineales,
+         consumo_estimado_kg, pistas_detalle, portabobinas_asignados, estado
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,'Programada')
        RETURNING *`,
       [
         codigoTirada, normalizarClave(clave_material), papel_utilizado || 'Papel Estándar',
@@ -798,7 +801,8 @@ router.post('/aprobar-tirada', async (req, res) => {
         Number(ancho_bobina_mm) || 0, Number(ancho_utilizado_mm) || 0,
         Number(trim_mm) || 0, Number(trim_porcentaje) || 0,
         Number(metros_lineales) || 0, Number(consumo_estimado_kg) || 0,
-        JSON.stringify(pistas)
+        JSON.stringify(pistas),
+        portabobinas_asignados ? JSON.stringify(portabobinas_asignados) : null
       ]
     );
 
@@ -889,7 +893,7 @@ router.put('/programas/:id', async (req, res) => {
   const {
     clave_material, papel_utilizado, es_alternativa_manual = false, motivo_alternativa = '',
     ancho_bobina_mm, ancho_utilizado_mm, trim_mm, trim_porcentaje,
-    metros_lineales, consumo_estimado_kg = 0, pistas = []
+    metros_lineales, consumo_estimado_kg = 0, pistas = [], portabobinas_asignados = null
   } = req.body;
   try {
     const upd = await db.query(
@@ -897,8 +901,9 @@ router.put('/programas/:id', async (req, res) => {
        SET clave_material = $1, papel_utilizado = $2, es_alternativa_manual = $3,
            motivo_alternativa = $4, ancho_bobina_mm = $5, ancho_utilizado_mm = $6,
            trim_mm = $7, trim_porcentaje = $8, metros_lineales = $9,
-           consumo_estimado_kg = $10, pistas_detalle = $11::jsonb
-       WHERE id = $12 AND estado = 'Programada'
+           consumo_estimado_kg = $10, pistas_detalle = $11::jsonb,
+           portabobinas_asignados = $12::jsonb
+       WHERE id = $13 AND estado = 'Programada'
        RETURNING *`,
       [
         normalizarClave(clave_material), papel_utilizado || 'Papel Estándar',
@@ -906,7 +911,9 @@ router.put('/programas/:id', async (req, res) => {
         Number(ancho_bobina_mm) || 0, Number(ancho_utilizado_mm) || 0,
         Number(trim_mm) || 0, Number(trim_porcentaje) || 0,
         Number(metros_lineales) || 0, Number(consumo_estimado_kg) || 0,
-        JSON.stringify(pistas), Number(req.params.id)
+        JSON.stringify(pistas),
+        portabobinas_asignados ? JSON.stringify(portabobinas_asignados) : null,
+        Number(req.params.id)
       ]
     );
     if (upd.rows.length === 0) {
