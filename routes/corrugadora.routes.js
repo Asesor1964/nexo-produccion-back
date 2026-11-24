@@ -910,7 +910,8 @@ router.post('/aprobar-tirada', async (req, res) => {
 
       await db.query(
         `UPDATE public.corrugadora_pendientes
-         SET pendiente = GREATEST(0, pendiente - $1),
+         SET planchas_necesarias = CASE WHEN COALESCE(planchas_necesarias, 0) < pendiente THEN pendiente ELSE planchas_necesarias END,
+             pendiente = GREATEST(0, pendiente - $1),
              actualizado_en = NOW()
          WHERE numero_orden = $2`,
         [plTirada, numOrd]
