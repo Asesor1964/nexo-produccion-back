@@ -1242,4 +1242,29 @@ router.post('/stock-papeles/movimiento', async (req, res) => {
   }
 });
 
+// =========================================================================
+// 9. ✅ DAR POR CUMPLIDO / CERRAR SALDO PENDIENTE MANUALMENTE
+// =========================================================================
+router.put('/pendientes/:numero_orden/cerrar', async (req, res) => {
+  const numOrden = parseInt(req.params.numero_orden, 10);
+  if (!numOrden) {
+    return res.status(400).json({ error: 'Número de orden inválido.' });
+  }
+  try {
+    const upd = await db.query(
+      `UPDATE public.corrugadora_pendientes
+       SET pendiente = 0, actualizado_en = NOW()
+       WHERE numero_orden = $1
+       RETURNING numero_orden`,
+      [numOrden]
+    );
+    if (upd.rows.length === 0) {
+      return res.status(404).json({ error: 'Orden pendiente no encontrada.' });
+    }
+    res.json({ status: 'ok', mensaje: `Orden #${numOrden} dada por cumplida y retirada de pendientes.` });
+  } catch (error) {
+    res.status(500).json({ error: 'Error cerrando orden pendiente: ' + error.message });
+  }
+});
+
 module.exports = router;
