@@ -516,7 +516,7 @@ router.get('/contexto', async (req, res) => {
     let pedidosNormalizados = [];
     let origenPedidos = 'CORRUGADORA_CSV';
 
-    if (resPendCorr.rows.length > 0) {
+     if (resPendCorr.rows.length > 0) {
       pedidosNormalizados = resPendCorr.rows.map(r => ({
         id: r.numero_orden,
         numero_orden: r.numero_orden,
@@ -529,11 +529,13 @@ router.get('/contexto', async (req, res) => {
         ancho_pref_mm: r.ancho_pref_mm ? Number(r.ancho_pref_mm) : null,
         cantidad_pendiente: Number(r.pendiente) || 0,
         planchas_necesarias: Number(r.pendiente) || 0,
+        planchas_originales: Number(r.planchas_necesarias) || Number(r.pendiente) || 0,
         m2_pendientes: Number(r.m2_pendientes) || 0,
         fecha_entrega: r.fecha_entrega,
         bocas: 1
       }));
-    } else {
+    }
+    else {
       origenPedidos = 'ORDENES_PRODUCCION';
       const resOrd = await db.query(`
         SELECT 
@@ -577,7 +579,7 @@ router.get('/contexto', async (req, res) => {
           clave: p.clave_material,
           onda: 'C',
           es_doble_onda: false,
-          liner_ext_ideal: 'Sin receta cargada',
+          liner_ext_ideal: 'Sin receta cargada',     
           medium_ideal: '',
           liner_int_ideal: '',
           alternativas_aprobadas: []
@@ -900,6 +902,21 @@ router.post('/aprobar-tirada', async (req, res) => {
       ]
     );
 
+    // 🔄 Descontar planchas programadas de la cola de pendientes de Corrugadora
+    for (const pista of pistas) {
+      const numOrd = parseInt(pista.numero_orden, 10);
+      const plTirada = Math.max(0, Math.round(Number(pista.planchas_tirada) || 0));
+      if (!numOrd || plTirada <= 0) continue;
+
+      await db.query(
+        `UPDATE public.corrugadora_pendientes
+         SET pendiente = GREATEST(0, pendiente - $1),
+             actualizado_en = NOW()
+         WHERE numero_orden = $2`,
+        [plTirada, numOrd]
+      ).catch(() => {});
+    }
+
     if (habilitar_en_conversion) {
       for (const pista of pistas) {
         const numOrd = parseInt(pista.numero_orden, 10);
@@ -1097,13 +1114,36 @@ router.put('/programas/:id/estado', async (req, res) => {
   }
 });
 
-// Quitar tirada programada de la cola
+// Quitar tirada programada de la cola y devolver las planchas al saldo pendiente
 router.delete('/programas/:id', async (req, res) => {
   try {
-    await db.query(
-      "DELETE FROM public.corrugadora_programas WHERE id = $1 AND estado = 'Programada'",
+    const resProg = await db.query(
+      "SELECT pistas_detalle FROM public.corrugadora_programas WHERE id = $1 AND estado = 'Programada'",
       [Number(req.params.id)]
     );
+
+    if (resProg.rows.length > 0) {
+      const pistas = Array.isArray(resProg.rows[0].pistas_detalle) ? resProg.rows[0].pistas_detalle : [];
+      for (const pista of pistas) {
+        const numOrd = parseInt(pista.numero_orden, 10);
+        const plTirada = Math.max(0, Math.round(Number(pista.planchas_tirada) || 0));
+        if (!numOrd || plTirada <= 0) continue;
+
+        await db.query(
+          `UPDATE public.corrugadora_pendientes
+           SET pendiente = LEAST(COALESCE(NULLIF(planchas_necesarias, 0), pendiente + $1), pendiente + $1),
+               actualizado_en = NOW()
+           WHERE numero_orden = $2`,
+          [plTirada, numOrd]
+        ).catch(() => {});
+      }
+
+      await db.query(
+        "DELETE FROM public.corrugadora_programas WHERE id = $1 AND estado = 'Programada'",
+        [Number(req.params.id)]
+      );
+    }
+
     res.json({ status: 'ok' });
   } catch (error) {
     res.status(500).json({ error: error.message });
