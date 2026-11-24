@@ -162,6 +162,23 @@ const asegurarTablasCorrugadora = async () => {
         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // 7. Fórmulas Originales y Alternativas de Papeles (desde RECETAS.csv)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.corrugadora_recetas_formulas (
+        id SERIAL PRIMARY KEY,
+        clave VARCHAR(80) NOT NULL,
+        formula_tipo VARCHAR(30) DEFAULT 'ORIGINAL',
+        es_doble_onda BOOLEAN DEFAULT FALSE,
+        liner_ext VARCHAR(60) DEFAULT '',
+        onda_1 VARCHAR(60) DEFAULT '',
+        entretapa VARCHAR(60) DEFAULT '',
+        onda_2 VARCHAR(60) DEFAULT '',
+        liner_int VARCHAR(60) DEFAULT '',
+        actualizado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
   } catch (err) {
     console.error('Aviso inicializando tablas de Corrugadora:', err.message);
   }
@@ -421,17 +438,79 @@ router.post('/importar-pendientes', async (req, res) => {
   }
 });
 
+// D) Importar RECETAS.csv (Fórmulas Originales y Alternativas por Clave)
+router.post('/importar-recetas', async (req, res) => {
+  const { recetas = [] } = req.body;
+  if (!Array.isArray(recetas) || recetas.length === 0) {
+    return res.status(400).json({ error: 'No se recibieron recetas válidas.' });
+  }
+
+  const normalizarPapel = (txt) =>
+    String(txt || '')
+      .trim()
+      .toUpperCase()
+      .replace(/^([A-Z]+)(\d)/, '$1 $2'); // "B150" -> "B 150", "OE180" -> "OE 180"
+
+  try {
+    await db.query('TRUNCATE TABLE public.corrugadora_recetas_formulas RESTART IDENTITY');
+
+    let procesadas = 0;
+    for (const r of recetas) {
+      const clave = normalizarClave(r.clave);
+      const tipo = String(r.formula_tipo || '').trim().toUpperCase();
+      if (!clave || clave === 'SIN_CLAVE' || clave === 'CLAVES') continue;
+      if (tipo !== 'ORIGINAL' && tipo !== 'ALTERNATIVO') continue;
+
+      const p1 = normalizarPapel(r.p1);
+      const p2 = normalizarPapel(r.p2);
+      const p3 = normalizarPapel(r.p3);
+      const p4 = normalizarPapel(r.p4);
+      const p5 = normalizarPapel(r.p5);
+      const esDoble = Boolean(p4 || p5);
+
+      await db.query(
+        `INSERT INTO public.corrugadora_recetas_formulas (
+           clave, formula_tipo, es_doble_onda, liner_ext, onda_1, entretapa, onda_2, liner_int
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          clave,
+          tipo,
+          esDoble,
+          p1,
+          p2,
+          esDoble ? p3 : '',
+          esDoble ? p4 : '',
+          esDoble ? p5 : p3
+        ]
+      );
+      procesadas++;
+    }
+
+    res.json({
+      status: 'ok',
+      procesadas,
+      mensaje: `Se cargaron ${procesadas} fórmulas (Originales y Alternativas) desde RECETAS.csv.`
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error importando RECETAS.csv: ' + error.message });
+  }
+});
+
 // =========================================================================
 // 3. OBTENER CONTEXTO COMPLETO PARA EL PROGRAMADOR DE CORRUGADORA
 // =========================================================================
 router.get('/contexto', async (req, res) => {
   try {
-    const [resAnchos, resClaves, resPapeles, resPendCorr, resProgramas] = await Promise.all([
+    const [resAnchos, resClaves, resPapeles, resPendCorr, resProgramas, resRecetas] = await Promise.all([
       db.query('SELECT * FROM public.corrugadora_anchos_bobina ORDER BY ancho_mm ASC'),
       db.query('SELECT * FROM public.corrugadora_claves_material ORDER BY clave ASC'),
       db.query('SELECT * FROM public.corrugadora_stock_papeles WHERE stock_kg > 0 ORDER BY tipo_papel ASC, gramaje ASC'),
       db.query('SELECT * FROM public.corrugadora_pendientes WHERE pendiente > 0 ORDER BY fecha_entrega ASC NULLS LAST, numero_orden ASC'),
-      db.query('SELECT * FROM public.corrugadora_programas ORDER BY id DESC LIMIT 40')
+      db.query('SELECT * FROM public.corrugadora_programas ORDER BY id DESC LIMIT 40'),
+      db.query(`
+        SELECT * FROM public.corrugadora_recetas_formulas
+        ORDER BY clave ASC, CASE WHEN formula_tipo = 'ORIGINAL' THEN 0 ELSE 1 END, id ASC
+      `)
     ]);
 
     let pedidosNormalizados = [];
@@ -512,7 +591,9 @@ router.get('/contexto', async (req, res) => {
       claves: Array.from(clavesMap.values()).sort((a, b) => a.clave.localeCompare(b.clave)),
       papeles_stock: resPapeles.rows,
       pedidos: pedidosNormalizados,
-      programas: resProgramas.rows
+      programas: resProgramas.rows,
+      recetas_formulas: resRecetas.rows
+
     });
   } catch (error) {
     console.error('❌ Error cargando contexto de Corrugadora:', error.message);
