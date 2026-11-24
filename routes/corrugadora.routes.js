@@ -56,7 +56,6 @@ const asegurarTablasCorrugadora = async () => {
       );
     `);
 
-    // Asegurar columnas nuevas si la tabla ya existía de la versión anterior
     await db.query(`
       ALTER TABLE public.corrugadora_claves_material
         ADD COLUMN IF NOT EXISTS es_doble_onda BOOLEAN DEFAULT FALSE,
@@ -148,6 +147,21 @@ const asegurarTablasCorrugadora = async () => {
         ADD COLUMN IF NOT EXISTS portabobinas_asignados JSONB DEFAULT NULL;
     `).catch(() => {});
 
+    // 6. Historial de Movimientos y Consumos de Papel
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.corrugadora_movimientos_papel (
+        id SERIAL PRIMARY KEY,
+        codigo_papel VARCHAR(60) NOT NULL,
+        nombre_papel VARCHAR(200),
+        tipo_movimiento VARCHAR(30) NOT NULL,
+        cantidad_kg NUMERIC(10,2) NOT NULL,
+        stock_anterior_kg NUMERIC(10,2) DEFAULT 0,
+        stock_nuevo_kg NUMERIC(10,2) DEFAULT 0,
+        codigo_tirada VARCHAR(50),
+        observacion TEXT,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
   } catch (err) {
     console.error('Aviso inicializando tablas de Corrugadora:', err.message);
   }
@@ -179,14 +193,14 @@ const parseFechaISO = (fechaStr) => {
 const buscarRecetaPorClave = (clavesMap, claveStr) => {
   const full = normalizarClave(claveStr);
   if (clavesMap.has(full)) return clavesMap.get(full);
-  const base = full.split(/\s+/)[0]; // "TMZ390 RH" -> "TMZ390"
+  const base = full.split(/\s+/)[0];
   if (clavesMap.has(base)) return clavesMap.get(base);
   return null;
 };
 
 // Calcula el gramaje efectivo por m² de plancha (incluyendo factor de acanalado ~1.38 en ondas)
 const calcularGramajeEfectivoClave = (claveObj) => {
-  if (!claveObj) return 420; // Fallback estándar si no está cargada la receta
+  if (!claveObj) return 420;
   const le = Number(claveObj.liner_ext_gramaje) || 0;
   const o1 = (Number(claveObj.onda1_gramaje) || 0) * 1.38;
   const li = Number(claveObj.liner_int_gramaje) || 0;
@@ -197,7 +211,7 @@ const calcularGramajeEfectivoClave = (claveObj) => {
 };
 
 // =========================================================================
-// 2. ENDPOINTS DE IMPORTACIÓN DE LOS 4 CSV (CLAVES, PAPELES/BOBINAS, PENDIENTES)
+// 2. ENDPOINTS DE IMPORTACIÓN DE CSV (CLAVES, PAPELES/BOBINAS, PENDIENTES)
 // =========================================================================
 
 // A) Importar CLAVES.csv
@@ -474,12 +488,13 @@ router.get('/contexto', async (req, res) => {
       });
     }
 
-    // Unimos claves de la tabla maestra + claves detectadas en los pendientes
+    // Unimos claves de la tabla maestra + claves detectadas en pendientes (heredando receta base si existe)
     const clavesMap = new Map();
     resClaves.rows.forEach(c => clavesMap.set(normalizarClave(c.clave), c));
     pedidosNormalizados.forEach(p => {
       if (p.clave_material && p.clave_material !== 'SIN_CLAVE' && !clavesMap.has(p.clave_material)) {
-        clavesMap.set(p.clave_material, {
+        const base = buscarRecetaPorClave(clavesMap, p.clave_material);
+        clavesMap.set(p.clave_material, base ? { ...base, clave: p.clave_material } : {
           clave: p.clave_material,
           onda: 'C',
           es_doble_onda: false,
@@ -580,7 +595,7 @@ router.post('/optimizar', async (req, res) => {
     trim_maximo_pct = 5.5,
     forzar_ancho_bobina = null,
     forzar_orden_id = null,
-    ordenes_seleccionadas = [] // 👈 NUEVO: lista puntual de N° de órdenes a corrugar hoy
+    ordenes_seleccionadas = []
   } = req.body;
 
   try {
@@ -649,12 +664,10 @@ router.post('/optimizar', async (req, res) => {
     const candidatos = candidatosBase
       .filter(p => p.ancho_mm > 100 && p.largo_mm > 100 && p.planchas_necesarias > 0)
       .filter(p => clavesFiltro.size === 0 || clavesFiltro.has(p.clave_material))
-      .filter(p => seleccionSet.size === 0 || seleccionSet.has(Number(p.numero_orden))); // 👈 Solo los elegidos
-
-    
+      .filter(p => seleccionSet.size === 0 || seleccionSet.has(Number(p.numero_orden)));
 
     if (candidatos.length === 0) {
-      return res.json({ propuestas: [], mensaje: 'No hay pedidos pendientes con medidas válidas para esta clave.' });
+      return res.json({ propuestas: [], total_candidatos: 0, mensaje: 'No hay pedidos pendientes con medidas válidas para esta clave.' });
     }
 
     let bobinas = Array.isArray(anchos_disponibles) && anchos_disponibles.length > 0
@@ -925,7 +938,7 @@ router.put('/programas/:id', async (req, res) => {
   }
 });
 
-// Cambiar estado desde Cabina del Maquinista (Iniciar / Finalizar)
+// Cambiar estado desde Cabina del Maquinista (Iniciar / Finalizar + Descuento Automático de Stock)
 router.put('/programas/:id/estado', async (req, res) => {
   const { estado, metros_reales } = req.body;
   try {
@@ -937,12 +950,60 @@ router.put('/programas/:id/estado', async (req, res) => {
         [Number(req.params.id)]
       );
     } else if (estado === 'Finalizada') {
-      await db.query(
+      const mtsReales = Number(metros_reales) || 0;
+      const updProg = await db.query(
         `UPDATE public.corrugadora_programas
          SET estado = 'Finalizada', metros_reales = $1, fecha_fin = NOW()
-         WHERE id = $2`,
-        [Number(metros_reales) || 0, Number(req.params.id)]
+         WHERE id = $2
+         RETURNING *`,
+        [mtsReales, Number(req.params.id)]
       );
+
+      // 🔄 Descuento automático de stock físico por cada portabobina asignado
+      const prog = updProg.rows[0];
+      if (prog && prog.portabobinas_asignados && mtsReales > 0) {
+        const anchoM = (Number(prog.ancho_bobina_mm) || 0) / 1000;
+        const asignados = prog.portabobinas_asignados;
+
+        for (const [puesto, infoPapel] of Object.entries(asignados)) {
+          if (!infoPapel || !infoPapel.codigo) continue;
+          const esOnda = puesto === 'onda_1' || puesto === 'onda_2';
+          const factorOnda = esOnda ? 1.38 : 1;
+          const gramaje = Number(infoPapel.gramaje) || 125;
+          const kgConsumidos = Number((anchoM * mtsReales * (gramaje / 1000) * factorOnda).toFixed(2));
+
+          if (kgConsumidos <= 0) continue;
+
+          const resPap = await db.query(
+            'SELECT codigo, nombre, stock_kg FROM public.corrugadora_stock_papeles WHERE codigo = $1',
+            [infoPapel.codigo]
+          );
+          if (resPap.rows.length > 0) {
+            const stockAnt = Number(resPap.rows[0].stock_kg) || 0;
+            const stockNuevo = Math.max(0, Number((stockAnt - kgConsumidos).toFixed(2)));
+
+            await db.query(
+              'UPDATE public.corrugadora_stock_papeles SET stock_kg = $1, actualizado_en = NOW() WHERE codigo = $2',
+              [stockNuevo, infoPapel.codigo]
+            );
+
+            await db.query(
+              `INSERT INTO public.corrugadora_movimientos_papel
+                 (codigo_papel, nombre_papel, tipo_movimiento, cantidad_kg, stock_anterior_kg, stock_nuevo_kg, codigo_tirada, observacion)
+               VALUES ($1, $2, 'CONSUMO_CORRUGADORA', $3, $4, $5, $6, $7)`,
+              [
+                infoPapel.codigo,
+                resPap.rows[0].nombre || infoPapel.nombre || '',
+                -kgConsumidos,
+                stockAnt,
+                stockNuevo,
+                prog.codigo_tirada,
+                `Consumo automático (${puesto.toUpperCase()} · ${mtsReales} mts · Bobina ${prog.ancho_bobina_mm}mm)`
+              ]
+            );
+          }
+        }
+      }
     } else {
       await db.query(
         'UPDATE public.corrugadora_programas SET estado = $1 WHERE id = $2',
@@ -965,6 +1026,97 @@ router.delete('/programas/:id', async (req, res) => {
     res.json({ status: 'ok' });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// =========================================================================
+// 8. 🧻 STOCK FÍSICO DE BOBINAS Y MOVIMIENTOS EN VIVO
+// =========================================================================
+
+router.get('/stock-papeles', async (req, res) => {
+  try {
+    const [resPapeles, resMovs, resHoy] = await Promise.all([
+      db.query('SELECT * FROM public.corrugadora_stock_papeles ORDER BY tipo_papel ASC, gramaje ASC, codigo ASC'),
+      db.query('SELECT * FROM public.corrugadora_movimientos_papel ORDER BY fecha DESC LIMIT 60'),
+      db.query(`
+        SELECT COALESCE(SUM(ABS(cantidad_kg)), 0) AS kg_hoy
+        FROM public.corrugadora_movimientos_papel
+        WHERE tipo_movimiento = 'CONSUMO_CORRUGADORA'
+          AND fecha::date = CURRENT_DATE
+      `)
+    ]);
+
+    const papeles = resPapeles.rows;
+    const totalKg = papeles.reduce((acc, p) => acc + (Number(p.stock_kg) || 0), 0);
+    const disponibles = papeles.filter(p => Number(p.stock_kg) > 0).length;
+    const criticos = papeles.filter(p => Number(p.stock_kg) > 0 && Number(p.punto_pedido_kg) > 0 && Number(p.stock_kg) <= Number(p.punto_pedido_kg)).length;
+    const sinStock = papeles.filter(p => Number(p.stock_kg) <= 0).length;
+
+    res.json({
+      papeles,
+      movimientos: resMovs.rows,
+      kpis: {
+        total_kg: Math.round(totalKg),
+        disponibles,
+        criticos,
+        sin_stock: sinStock,
+        consumido_hoy_kg: Math.round(Number(resHoy.rows[0]?.kg_hoy) || 0)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error cargando stock de papeles: ' + error.message });
+  }
+});
+
+router.post('/stock-papeles/movimiento', async (req, res) => {
+  const { codigo_papel, tipo_movimiento, cantidad_kg, observacion = '' } = req.body;
+  const cant = Number(cantidad_kg);
+  if (!codigo_papel || isNaN(cant) || cant < 0) {
+    return res.status(400).json({ error: 'Datos de movimiento inválidos.' });
+  }
+
+  try {
+    const resPap = await db.query(
+      'SELECT codigo, nombre, stock_kg FROM public.corrugadora_stock_papeles WHERE codigo = $1',
+      [codigo_papel]
+    );
+    if (resPap.rows.length === 0) {
+      return res.status(404).json({ error: 'Papel no encontrado.' });
+    }
+
+    const stockAnt = Number(resPap.rows[0].stock_kg) || 0;
+    let stockNuevo = stockAnt;
+    let delta = cant;
+
+    if (tipo_movimiento === 'INGRESO') {
+      stockNuevo = Number((stockAnt + cant).toFixed(2));
+      delta = cant;
+    } else if (tipo_movimiento === 'EGRESO') {
+      stockNuevo = Math.max(0, Number((stockAnt - cant).toFixed(2)));
+      delta = -cant;
+    } else if (tipo_movimiento === 'AJUSTE') {
+      stockNuevo = Number(cant.toFixed(2));
+      delta = Number((stockNuevo - stockAnt).toFixed(2));
+    }
+
+    await db.query(
+      'UPDATE public.corrugadora_stock_papeles SET stock_kg = $1, actualizado_en = NOW() WHERE codigo = $2',
+      [stockNuevo, codigo_papel]
+    );
+
+    await db.query(
+      `INSERT INTO public.corrugadora_movimientos_papel
+         (codigo_papel, nombre_papel, tipo_movimiento, cantidad_kg, stock_anterior_kg, stock_nuevo_kg, observacion)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [codigo_papel, resPap.rows[0].nombre || '', tipo_movimiento, delta, stockAnt, stockNuevo, observacion || 'Movimiento manual']
+    );
+
+    res.json({
+      status: 'ok',
+      mensaje: `Stock de ${codigo_papel} actualizado: ${stockAnt} kg → ${stockNuevo} kg.`
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error registrando movimiento: ' + error.message });
   }
 });
 
