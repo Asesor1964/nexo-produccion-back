@@ -1,6 +1,7 @@
 {
   "name": "nexo-produccion-back",
   "version": "1.0.0",
+  "description": "Backend de NEXO Producción - Gestión Industrial de Corrugadora y Conversión",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -8,9 +9,8 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
+  "author": "Sergio Enrique Sanchez, 1964",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
