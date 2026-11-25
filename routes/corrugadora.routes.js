@@ -364,6 +364,75 @@ router.post('/importar-papeles', async (req, res) => {
   }
 });
 
+// =========================================================================
+// 📥 IMPORTAR MACRO_BOBINAS.csv (Solo PAPEL CARTON, Activas, Ancho >= 1000 mm)
+// =========================================================================
+router.post('/importar-macro-bobinas', async (req, res) => {
+  const { grupos } = req.body;
+  if (!Array.isArray(grupos) || grupos.length === 0) {
+    return res.status(400).json({ error: 'No se recibieron bobinas válidas de PAPEL CARTON (>= 1000 mm).' });
+  }
+
+  try {
+    // 1. Leer catálogo actual para conservar códigos cortos (ej: "B02 ERI") por nombre de papel
+    const catRes = await db.query(
+      `SELECT DISTINCT ON (UPPER(TRIM(nombre))) codigo, UPPER(TRIM(nombre)) AS nom_key
+       FROM public.corrugadora_stock_papeles
+       WHERE codigo IS NOT NULL AND nombre IS NOT NULL`
+    );
+    const mapaCodigos = new Map();
+    catRes.rows.forEach(r => mapaCodigos.set(r.nom_key, r.codigo));
+
+    // 2. Reemplazar el stock actual por el inventario real con formato
+    await db.query('DELETE FROM public.corrugadora_stock_papeles');
+
+    let insertados = 0;
+    for (const g of grupos) {
+      const nomKey = String(g.nombre || '').trim().toUpperCase();
+      let codigoFinal = mapaCodigos.get(nomKey);
+
+      if (!codigoFinal) {
+        const prefTipo = String(g.tipo_papel || 'PAP').replace(/[^A-Z]/gi, '').slice(0, 2).toUpperCase();
+        const prefFab = String(g.fabricante || 'GEN').replace(/[^A-Z]/gi, '').slice(0, 3).toUpperCase();
+        codigoFinal = `${prefTipo}${g.gramaje || 0} ${prefFab}`.trim();
+      }
+
+      await db.query(
+        `INSERT INTO public.corrugadora_stock_papeles
+          (codigo, nombre, tipo_papel, gramaje, fabricante, proveedor, color, stock_kg, punto_pedido_kg, ancho_mm, cantidad_bobinas, actualizado_en)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, NOW())
+         ON CONFLICT (codigo, ancho_mm) DO UPDATE SET
+           stock_kg = public.corrugadora_stock_papeles.stock_kg + EXCLUDED.stock_kg,
+           cantidad_bobinas = public.corrugadora_stock_papeles.cantidad_bobinas + EXCLUDED.cantidad_bobinas,
+           actualizado_en = NOW()`,
+        [
+          codigoFinal,
+          g.nombre,
+          g.tipo_papel || '',
+          Number(g.gramaje) || 0,
+          g.fabricante || '',
+          g.proveedor || '',
+          g.color || '',
+          Math.round(Number(g.stock_kg) || 0),
+          Number(g.ancho_mm) || 0,
+          Number(g.cantidad_bobinas) || 0
+        ]
+      );
+      insertados++;
+    }
+
+    const totalKg = Math.round(grupos.reduce((acc, g) => acc + (Number(g.stock_kg) || 0), 0));
+    const totalBob = grupos.reduce((acc, g) => acc + (Number(g.cantidad_bobinas) || 0), 0);
+
+    res.json({
+      status: 'ok',
+      mensaje: `Stock actualizado desde MACRO_BOBINAS: ${totalBob} bobinas (${totalKg.toLocaleString('es-AR')} kg) en ${insertados} combinaciones Papel + Formato (>= 1000 mm).`
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error importando MACRO_BOBINAS: ' + error.message });
+  }
+});
+
 // C) Importar PENDIENTES DE CORRUGADORA.csv
 router.post('/importar-pendientes', async (req, res) => {
   const { pendientes = [], reemplazar_cola = true } = req.body;
