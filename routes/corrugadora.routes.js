@@ -179,6 +179,15 @@ const asegurarTablasCorrugadora = async () => {
       );
     `);
 
+    // 8. Catálogo de Trazados por Código de Producto (desde TRAZADORES.csv)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.corrugadora_trazados_producto (
+        codigo_producto VARCHAR(80) PRIMARY KEY,
+        trazados VARCHAR(120) DEFAULT '',
+        actualizado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
   } catch (err) {
     console.error('Aviso inicializando tablas de Corrugadora:', err.message);
   }
@@ -565,6 +574,64 @@ router.post('/importar-recetas', async (req, res) => {
   }
 });
 
+// E) Importar TRAZADORES.csv (Trazados históricos por Código de Producto)
+router.post('/importar-trazadores', async (req, res) => {
+  const { trazadores = [] } = req.body;
+  if (!Array.isArray(trazadores) || trazadores.length === 0) {
+    return res.status(400).json({ error: 'No se recibieron trazadores válidos.' });
+  }
+  try {
+    let procesados = 0;
+    for (const t of trazadores) {
+      const cod = String(t.codigo_producto || '').trim().toUpperCase();
+      if (!cod) continue;
+      const traz = String(t.trazados ?? '').replace(/"/g, '').trim();
+
+      await db.query(
+        `INSERT INTO public.corrugadora_trazados_producto (codigo_producto, trazados, actualizado_en)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (codigo_producto) DO UPDATE SET
+           trazados = EXCLUDED.trazados,
+           actualizado_en = NOW()`,
+        [cod, traz]
+      );
+      procesados++;
+    }
+    res.json({
+      status: 'ok',
+      procesados,
+      mensaje: `Se sincronizaron los trazados de ${procesados} productos desde TRAZADORES.csv.`
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error importando TRAZADORES.csv: ' + error.message });
+  }
+});
+
+// Helper: carga mapa de trazados y cruce numero_orden -> codigo_producto
+const cargarMapaTrazados = async () => {
+  const [resTraz, resMapOrd] = await Promise.all([
+    db.query('SELECT codigo_producto, trazados FROM public.corrugadora_trazados_producto'),
+    db.query('SELECT numero_orden, codigo_producto FROM public.corrugadora_pendientes')
+  ]);
+  const trazMap = new Map();
+  resTraz.rows.forEach(r => {
+    const k = String(r.codigo_producto || '').trim().toUpperCase();
+    if (k) trazMap.set(k, String(r.trazados ?? '').trim());
+  });
+  const ordCodMap = new Map();
+  resMapOrd.rows.forEach(r => {
+    if (r.numero_orden && r.codigo_producto) {
+      ordCodMap.set(Number(r.numero_orden), String(r.codigo_producto).trim().toUpperCase());
+    }
+  });
+  return { trazMap, ordCodMap };
+};
+
+const resolverTrazado = (trazMap, ordCodMap, codigoProd, numOrden) => {
+  const cod = String(codigoProd || '').trim().toUpperCase() || ordCodMap.get(Number(numOrden)) || '';
+  return cod ? (trazMap.get(cod) ?? '') : '';
+};
+
 // =========================================================================
 // 3. OBTENER CONTEXTO COMPLETO PARA EL PROGRAMADOR DE CORRUGADORA
 // =========================================================================
@@ -582,14 +649,17 @@ router.get('/contexto', async (req, res) => {
       `)
     ]);
 
+    const { trazMap, ordCodMap } = await cargarMapaTrazados();
+
     let pedidosNormalizados = [];
     let origenPedidos = 'CORRUGADORA_CSV';
 
-     if (resPendCorr.rows.length > 0) {
+    if (resPendCorr.rows.length > 0) {
       pedidosNormalizados = resPendCorr.rows.map(r => ({
         id: r.numero_orden,
         numero_orden: r.numero_orden,
         codigo_producto: r.codigo_producto,
+        trazados: resolverTrazado(trazMap, ordCodMap, r.codigo_producto, r.numero_orden),
         cliente: r.cliente,
         producto_descripcion: r.descripcion,
         clave_material: normalizarClave(r.clave_material),
@@ -603,8 +673,7 @@ router.get('/contexto', async (req, res) => {
         fecha_entrega: r.fecha_entrega,
         bocas: 1
       }));
-    }
-    else {
+    } else {
       origenPedidos = 'ORDENES_PRODUCCION';
       const resOrd = await db.query(`
         SELECT 
@@ -628,6 +697,7 @@ router.get('/contexto', async (req, res) => {
         const bocas = Math.max(1, Number(r.bocas) || 1);
         return {
           ...r,
+          trazados: resolverTrazado(trazMap, ordCodMap, r.codigo_producto, r.numero_orden),
           clave_material: normalizarClave(r.clave_raw),
           largo_mm: Number(r.largo_mm) || 0,
           ancho_mm: Number(r.ancho_mm) || 0,
@@ -648,7 +718,7 @@ router.get('/contexto', async (req, res) => {
           clave: p.clave_material,
           onda: 'C',
           es_doble_onda: false,
-          liner_ext_ideal: 'Sin receta cargada',     
+          liner_ext_ideal: 'Sin receta cargada',
           medium_ideal: '',
           liner_int_ideal: '',
           alternativas_aprobadas: []
@@ -656,15 +726,24 @@ router.get('/contexto', async (req, res) => {
       }
     });
 
+    const programasEnriquecidos = resProgramas.rows.map(prog => ({
+      ...prog,
+      pistas_detalle: (Array.isArray(prog.pistas_detalle) ? prog.pistas_detalle : []).map(p => ({
+        ...p,
+        trazados: p.trazados !== undefined && p.trazados !== ''
+          ? p.trazados
+          : resolverTrazado(trazMap, ordCodMap, p.codigo_producto, p.numero_orden)
+      }))
+    }));
+
     res.json({
       origen_pedidos: origenPedidos,
       anchos: resAnchos.rows,
       claves: Array.from(clavesMap.values()).sort((a, b) => a.clave.localeCompare(b.clave)),
       papeles_stock: resPapeles.rows,
       pedidos: pedidosNormalizados,
-      programas: resProgramas.rows,
+      programas: programasEnriquecidos,
       recetas_formulas: resRecetas.rows
-
     });
   } catch (error) {
     console.error('❌ Error cargando contexto de Corrugadora:', error.message);
@@ -758,11 +837,14 @@ router.post('/optimizar', async (req, res) => {
 
     const claveInfoObj = resClaveInfo.rows[0] || null;
     const gramajeEfectivoM2 = calcularGramajeEfectivoClave(claveInfoObj);
+    const { trazMap, ordCodMap } = await cargarMapaTrazados();
 
     let candidatosBase = [];
     if (resPendCorr.rows.length > 0) {
       candidatosBase = resPendCorr.rows.map(r => ({
         numero_orden: r.numero_orden,
+        codigo_producto: r.codigo_producto,
+        trazados: resolverTrazado(trazMap, ordCodMap, r.codigo_producto, r.numero_orden),
         cliente: r.cliente,
         producto_descripcion: r.descripcion,
         clave_material: normalizarClave(r.clave_material),
@@ -863,6 +945,8 @@ router.post('/optimizar', async (req, res) => {
 
         return {
           numero_orden: p.orden.numero_orden,
+          codigo_producto: p.orden.codigo_producto || '',
+          trazados: p.orden.trazados ?? resolverTrazado(trazMap, ordCodMap, p.orden.codigo_producto, p.orden.numero_orden),
           cliente: p.orden.cliente,
           producto_descripcion: p.orden.producto_descripcion,
           clave_material: p.orden.clave_material,
@@ -1029,6 +1113,8 @@ router.get('/cola-maquinista', async (req, res) => {
       db.query('SELECT * FROM public.corrugadora_claves_material')
     ]);
 
+    const { trazMap, ordCodMap } = await cargarMapaTrazados();
+
     const clavesMap = new Map();
     resClaves.rows.forEach(c => clavesMap.set(normalizarClave(c.clave), c));
 
@@ -1037,6 +1123,12 @@ router.get('/cola-maquinista', async (req, res) => {
       const recetaBase = buscarRecetaPorClave(clavesMap, claveNorm);
       return {
         ...prog,
+        pistas_detalle: (Array.isArray(prog.pistas_detalle) ? prog.pistas_detalle : []).map(p => ({
+          ...p,
+          trazados: p.trazados !== undefined && p.trazados !== ''
+            ? p.trazados
+            : resolverTrazado(trazMap, ordCodMap, p.codigo_producto, p.numero_orden)
+        })),
         orden_cola: idx + 1,
         es_rh: /\bRH\b/.test(claveNorm),
         es_blanco: claveNorm.includes('BLANCO'),
